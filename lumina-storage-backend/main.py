@@ -130,10 +130,26 @@ def create_app() -> FastAPI:
 
     app.include_router(upload.router, prefix="/api/v1")
 
-    # Mount static files for uploads
+    # Phục vụ tĩnh CHỈ asset branding công khai (logo/favicon) — chúng hiển thị
+    # TRƯỚC đăng nhập (trang login) nên bắt buộc public.
+    #
+    # Trước đây mount rộng "/uploads" phơi TOÀN BỘ thư mục uploads/ — gồm cả document
+    # của user (LocalStorageBackend lưu uploads/YYYY/MM/<uuid>) — KHÔNG kiểm quyền,
+    # tức IDOR/lộ dữ liệu. Document phải đi qua endpoint download có authz; chỉ branding
+    # mới được phục vụ tĩnh, và giới hạn đúng 2 thư mục con.
     uploads_dir = Path("uploads")
-    uploads_dir.mkdir(exist_ok=True)
-    app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
+    for _sub in ("logos", "favicons"):
+        (uploads_dir / _sub).mkdir(parents=True, exist_ok=True)
+    app.mount(
+        "/uploads/logos",
+        StaticFiles(directory=uploads_dir / "logos"),
+        name="uploads-logos",
+    )
+    app.mount(
+        "/uploads/favicons",
+        StaticFiles(directory=uploads_dir / "favicons"),
+        name="uploads-favicons",
+    )
 
     return app
 
