@@ -19,6 +19,7 @@ def get_arq_pool(request: Request) -> ArqRedis:
 
 @router.post("/ping", status_code=202)
 async def ping(
+    current_user: CurrentUser,
     arq_pool: ArqRedis = Depends(get_arq_pool),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -27,6 +28,7 @@ async def ping(
         func_name="ping_task",
         task_name="ping",
         db=db,
+        owner_id=current_user.id,
     )
     return {
         "id": str(task.id),
@@ -92,10 +94,13 @@ async def list_tasks(
 @router.get("/{task_id}")
 async def get_task(
     task_id: uuid.UUID,
+    current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     task = await db.get(BackgroundTask, task_id)
-    if task is None:
+    # Non-admin chỉ đọc được task của chính mình. Trả 404 (không 403) để không
+    # lộ sự tồn tại của task người khác.
+    if task is None or (not is_admin(current_user) and task.owner_id != current_user.id):
         raise HTTPException(status_code=404, detail="Task not found")
     return {
         "id": str(task.id),
