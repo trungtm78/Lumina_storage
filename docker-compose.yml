@@ -183,6 +183,33 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # ── Test runner (profile "test") ─────────────────────────────────────────
+  # Chạy: docker compose --profile test run --rm test
+  # Dùng DB test riêng trên postgres container (schema tạo từ Base.metadata).
+  test:
+    profiles: ["test"]
+    build:
+      context: ./lumina-storage-backend
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-lumina}:${POSTGRES_PASSWORD:-lumina123}@postgres:5432/lumina_driver_test
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      GOTENBERG_URL: http://gotenberg:3000
+    # Mount source + tests live (tests/ bị .dockerignore loại khỏi image) →
+    # sửa code/test trên host, chạy lại không cần rebuild (TDD nhanh).
+    volumes:
+      - ./lumina-storage-backend/src:/app/src:ro
+      - ./lumina-storage-backend/tests:/app/tests:ro
+      - ./lumina-storage-backend/main.py:/app/main.py:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # Frontend (lumina-storage-frontend) runs OUTSIDE docker:
   #   cd lumina-storage-frontend && npm install && npm run dev
   # Vite defaults to port 5174 (strictPort in vite.config.ts).

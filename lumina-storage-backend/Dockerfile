@@ -50,3 +50,19 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:1688/api/v1/health || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "1688", "--workers", "4"]
+
+# ── Stage 3: test image (dev deps + source, chạy pytest) ────────────────────
+# Tách riêng để không phình runtime. Cài libmagic1 vì python-magic cần nó khi
+# test storage/upload; uv sync (bỏ --no-dev) để có pytest/respx/fakeredis.
+FROM builder AS test
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN uv sync --frozen
+COPY . .
+ENV PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:$PATH"
+CMD ["uv", "run", "pytest", "-q"]
