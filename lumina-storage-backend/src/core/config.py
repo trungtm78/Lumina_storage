@@ -70,6 +70,29 @@ class Settings(BaseSettings):
         return f"redis://{self.redis_host}:{self.redis_port}"
 
 
+_PLACEHOLDER_SECRETS = {"changeme", "your-secret-key-here", ""}
+
+
+def validate_secrets(settings: Settings) -> None:
+    """Fail-fast nếu production dùng secret yếu/placeholder; dev chỉ cảnh báo.
+
+    Một SECRET_KEY placeholder hoặc quá ngắn cho phép kẻ tấn công forge JWT
+    (chiếm quyền admin). Ở production phải chặn ngay lúc khởi động.
+    """
+    import logging
+
+    weak = settings.secret_key in _PLACEHOLDER_SECRETS or len(settings.secret_key) < 32
+    if not weak:
+        return
+    msg = (
+        "SECRET_KEY là placeholder hoặc quá ngắn (<32 ký tự). "
+        'Sinh khóa: python -c "import secrets; print(secrets.token_urlsafe(32))"'
+    )
+    if settings.app_env == "production":
+        raise RuntimeError(msg)
+    logging.getLogger(__name__).warning("[config] %s", msg)
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

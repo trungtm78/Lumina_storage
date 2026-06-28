@@ -78,6 +78,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Lumina Driver Backend", version="1.0.0", lifespan=lifespan)
 
     settings = get_settings()
+
+    # Fail-fast nếu production dùng SECRET_KEY yếu/placeholder.
+    from src.core.config import validate_secrets
+    validate_secrets(settings)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
