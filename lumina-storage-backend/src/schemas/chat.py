@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CreateSessionRequest(BaseModel):
@@ -44,7 +44,8 @@ class MessageResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     content: str
-    document_ids: list[uuid.UUID] | None = None
+    # Cap số document đính kèm để giới hạn N permission-check mỗi request.
+    document_ids: list[uuid.UUID] | None = Field(default=None, max_length=50)
     model_id: uuid.UUID | None = None
 
 

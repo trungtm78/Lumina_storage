@@ -64,6 +64,11 @@ class SkillContext:
         doc = await DocumentRepository(self.db).get_by_id_active(uuid.UUID(document_id))
         if doc is None:
             raise ValueError(f"Document {document_id} not found")
+        # Chống IDOR: skill script chỉ đọc được doc mà user có quyền viewer.
+        from src.services.document_permission import DocumentPermissionService
+        await DocumentPermissionService(self.db).check_permission(
+            self.user, document_id=doc.id, required="viewer"
+        )
         from src.models.storage import StorageConfig
         storage_cfg = await self.db.get(StorageConfig, doc.storage_config_id)
         if storage_cfg is None:

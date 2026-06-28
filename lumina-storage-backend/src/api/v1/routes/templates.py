@@ -466,6 +466,11 @@ async def extract_template_from_document(
     doc = await db.get(Document, document_id)
     if not doc or doc.deleted_at is not None:
         raise HTTPException(404, "Document not found")
+    # Chống IDOR: chỉ user có quyền viewer trên document mới trigger extraction.
+    from src.services.document_permission import DocumentPermissionService
+    await DocumentPermissionService(db).check_permission(
+        current_user, document_id=document_id, required="viewer"
+    )
 
     # Mark as pending immediately so GET /templates/{id} doesn't 404 during polling
     meta = dict(doc.source_metadata or {})
@@ -513,6 +518,11 @@ async def extract_template_draft_endpoint(
     doc = await db.get(Document, document_id)
     if not doc or doc.deleted_at is not None:
         raise HTTPException(404, "Document not found")
+    # Chống IDOR: chỉ user có quyền viewer trên document mới trigger extraction.
+    from src.services.document_permission import DocumentPermissionService
+    await DocumentPermissionService(db).check_permission(
+        current_user, document_id=document_id, required="viewer"
+    )
 
     meta = dict(doc.source_metadata or {})
     meta["extraction_status"] = "pending"
@@ -558,6 +568,11 @@ async def get_template_draft(
     doc = await db.get(Document, document_id)
     if not doc or doc.deleted_at is not None:
         raise HTTPException(404, "Document not found")
+    # Chống IDOR: chỉ user có quyền viewer trên document mới trigger extraction.
+    from src.services.document_permission import DocumentPermissionService
+    await DocumentPermissionService(db).check_permission(
+        current_user, document_id=document_id, required="viewer"
+    )
     if doc.owner_id != current_user.id:
         raise HTTPException(403, "Not allowed")
 

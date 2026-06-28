@@ -2213,6 +2213,11 @@ async def document_to_template(
     source_doc = await db.get(Document, body.document_id)
     if source_doc is None or source_doc.deleted_at is not None:
         raise HTTPException(404, "Document not found")
+    # Chống IDOR: chỉ user có quyền viewer mới chuyển document thành template.
+    from src.services.document_permission import DocumentPermissionService
+    await DocumentPermissionService(db).check_permission(
+        current_user, document_id=source_doc.id, required="viewer"
+    )
 
     if source_doc.source_type == "template":
         # Đã là template — trả thông tin sẵn có, không gọi AI

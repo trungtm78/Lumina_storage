@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.config import Settings
-from src.core.exceptions import NotFoundError
+from src.core.exceptions import ForbiddenError, NotFoundError
 from src.core.langfuse import get_langfuse_handler
 from src.models.chat import ChatMessage, ChatMessageSource, ChatSession
 from src.models.user import User
@@ -178,6 +178,31 @@ class ChatService:
             raise NotFoundError("Session not found")
         return session
 
+    async def _filter_permitted_documents(self, user, document_ids):
+        """Lọc document_ids → chỉ giữ doc user có quyền viewer (chống IDOR document).
+
+        document_ids do client truyền (chat attach) KHÔNG được tin tưởng: chỉ
+        những doc người dùng thực sự có quyền xem mới đưa vào RAG/attachment.
+        Trả None nếu đầu vào None (để nhánh ACL mặc định chạy)."""
+        if not document_ids:
+            return document_ids
+        perm_svc = DocumentPermissionService(self.db)
+        permitted = []
+        for did in document_ids:
+            try:
+                await perm_svc.check_permission(user, document_id=did, required="viewer")
+                permitted.append(did)
+            except (ForbiddenError, NotFoundError):
+                continue  # không quyền / không tồn tại → loại
+        dropped = len(document_ids) - len(permitted)
+        if dropped:
+            # Audit: ghi nhận attempt truy cập doc ngoài quyền (không làm fail request).
+            logging.getLogger(__name__).warning(
+                "[chat] user %s attached %d document(s) without permission (dropped)",
+                getattr(user, "id", "?"), dropped,
+            )
+        return permitted
+
     async def get_history(
         self,
         session_id: uuid.UUID,
@@ -303,6 +328,8 @@ class ChatService:
         model_id: uuid.UUID | None = None,
     ) -> AsyncIterator[str]:
         await self.assert_owned(session_id, current_user.id)
+        # Lọc document_ids do client truyền theo quyền (chống IDOR document).
+        document_ids = await self._filter_permitted_documents(current_user, document_ids)
         # 1. Save user message
         user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
         self.db.add(user_msg)
@@ -444,6 +471,8 @@ class ChatService:
     ) -> AsyncIterator[dict]:
         """Stream agent responses using LangGraph ReAct agent with tools."""
         await self.assert_owned(session_id, current_user.id)
+        # Lọc document_ids do client truyền theo quyền (chống IDOR document).
+        document_ids = await self._filter_permitted_documents(current_user, document_ids)
 
         # 1. Save user message with attachments
         attachment_data = None
