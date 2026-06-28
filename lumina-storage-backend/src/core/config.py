@@ -70,25 +70,45 @@ class Settings(BaseSettings):
         return f"redis://{self.redis_host}:{self.redis_port}"
 
 
-_PLACEHOLDER_SECRETS = {"changeme", "your-secret-key-here", ""}
+# Env được coi là an toàn để CHỈ cảnh báo (không fail) khi secret yếu.
+# Mọi env khác (production, staging, hoặc thiếu/không rõ) → strict fail-fast.
+_SAFE_ENVS = {"development", "dev", "local", "test", "testing"}
+# Substring placeholder phổ biến (đã normalize lower); chặn cả biến thể dài.
+_PLACEHOLDER_MARKERS = ("changeme", "change-me", "change me", "your-secret-key",
+                        "your_secret_key", "placeholder", "example", "secret-key-here")
+
+
+def _is_weak_secret(secret: str) -> bool:
+    """True nếu secret là placeholder, quá ngắn, hoặc entropy thấp."""
+    s = (secret or "").strip()
+    low = s.lower()
+    if low in {"", "changeme", "secret", "changethis"}:
+        return True
+    if any(marker in low for marker in _PLACEHOLDER_MARKERS):
+        return True
+    if len(s) < 32:
+        return True
+    if len(set(s)) <= 4:  # vd "x"*40 — đủ dài nhưng entropy quá thấp
+        return True
+    return False
 
 
 def validate_secrets(settings: Settings) -> None:
-    """Fail-fast nếu production dùng secret yếu/placeholder; dev chỉ cảnh báo.
+    """Fail-fast nếu SECRET_KEY yếu, TRỪ KHI env rõ ràng là dev/test (chỉ warn).
 
-    Một SECRET_KEY placeholder hoặc quá ngắn cho phép kẻ tấn công forge JWT
-    (chiếm quyền admin). Ở production phải chặn ngay lúc khởi động.
+    Mặc định strict: production/staging/env-không-rõ với secret yếu → raise.
+    Một SECRET_KEY placeholder/ngắn/low-entropy cho phép forge JWT (chiếm admin).
     """
     import logging
 
-    weak = settings.secret_key in _PLACEHOLDER_SECRETS or len(settings.secret_key) < 32
-    if not weak:
+    if not _is_weak_secret(settings.secret_key):
         return
     msg = (
-        "SECRET_KEY là placeholder hoặc quá ngắn (<32 ký tự). "
+        "SECRET_KEY là placeholder, quá ngắn (<32 ký tự), hoặc entropy thấp. "
         'Sinh khóa: python -c "import secrets; print(secrets.token_urlsafe(32))"'
     )
-    if settings.app_env == "production":
+    env = (settings.app_env or "").strip().lower()
+    if env not in _SAFE_ENVS:
         raise RuntimeError(msg)
     logging.getLogger(__name__).warning("[config] %s", msg)
 
