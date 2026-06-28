@@ -92,8 +92,13 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
+        expose_headers=["Content-Disposition", "X-Request-ID"],
     )
+
+    # Correlation-ID: gắn X-Request-ID cho mọi request (echo nếu client gửi UUID
+    # hợp lệ) + đẩy vào contextvar để structlog log ra request_id.
+    from asgi_correlation_id import CorrelationIdMiddleware
+    app.add_middleware(CorrelationIdMiddleware, header_name="X-Request-ID")
 
     # Wire the slowapi limiter declared in the auth router so its decorators take effect
     app.state.limiter = auth.limiter

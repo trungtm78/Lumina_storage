@@ -30,3 +30,17 @@ def test_exception_renders_valid_json(capsys):
     payload = json.loads(line)  # phải parse được (exc_info không vỡ JSON)
     assert payload["event"] == "failed"
     assert "boom" in payload.get("exception", "")
+
+
+def test_log_includes_request_id_from_contextvar(capsys):
+    from asgi_correlation_id.context import correlation_id
+    from src.core.logging import configure_logging, get_logger
+    token = correlation_id.set("test-req-id")
+    try:
+        configure_logging(force=True)
+        get_logger("t").info("evt")
+        out = capsys.readouterr().out
+        line = [ln for ln in out.strip().splitlines() if "evt" in ln][-1]
+        assert json.loads(line)["request_id"] == "test-req-id"
+    finally:
+        correlation_id.reset(token)

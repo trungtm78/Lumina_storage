@@ -45,14 +45,23 @@ class PayloadTooLargeError(AppException):
     detail = "File too large"
 
 
+def _request_id_headers() -> dict[str, str]:
+    """Gắn X-Request-ID vào response lỗi để client truy vết được (kể cả 500)."""
+    from asgi_correlation_id.context import correlation_id
+    cid = correlation_id.get()
+    return {"X-Request-ID": cid} if cid else {}
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppException)
     async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail},
+                            headers=_request_id_headers())
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
+        return JSONResponse(status_code=400, content={"detail": str(exc)},
+                            headers=_request_id_headers())
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -60,4 +69,5 @@ def register_exception_handlers(app: FastAPI) -> None:
         # đều trả JSONResponse — response này đi qua CORSMiddleware đúng cách,
         # tránh lỗi "No Access-Control-Allow-Origin" trên browser.
         logger.error("Unhandled exception on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"},
+                            headers=_request_id_headers())
