@@ -149,6 +149,24 @@ def _resolve_under_skills(
     return candidate
 
 
+def _jail_path(base_dir: Path, path: str) -> Path | None:
+    """Resolve `path` (do LLM cung cấp) trong `base_dir`, chặn path traversal.
+
+    Trả về target đã resolve nếu nằm TRONG base_dir; None nếu thoát ra ngoài
+    (vd "../../..", đường dẫn tuyệt đối). Khác `_resolve_under_skills` ở chỗ jail
+    theo base_dir tùy ý (search_files dùng skills_dir.parent) và không kiểm suffix
+    vì đầu vào là thư mục, không phải file. `base_dir` PHẢI đã resolve sẵn.
+    """
+    try:
+        target = (base_dir / path).resolve()
+        target.relative_to(base_dir)
+    except (ValueError, OSError, RuntimeError):
+        # ValueError: thoát ra ngoài base_dir. OSError/RuntimeError: symlink loop
+        # hoặc trạng thái fs xấu khi resolve(). Mọi trường hợp → None (opaque).
+        return None
+    return target
+
+
 # ── Tool 1: read_file ─────────────────────────────────────────────────
 
 @tool
@@ -335,9 +353,11 @@ async def search_files(
             lines.append(f"- **{r[1]}** (id=`{r[0]}`, file={r[2]})")
         return "\n".join(lines)
 
-    base_dir = Path(deps.settings.skills_dir).parent
-    target = base_dir / path
-    if not target.exists():
+    base_dir = Path(deps.settings.skills_dir).parent.resolve()
+    # Jail: `path` do LLM cung cấp không được thoát ra ngoài base_dir (path traversal).
+    # Trả "Path not found" cho cả trường hợp thoát ra ngoài để không lộ cấu trúc fs.
+    target = _jail_path(base_dir, path)
+    if target is None or not target.exists():
         return f"Path not found: {path}"
 
     matches = list(target.rglob(f"*{query}*"))[:20]
