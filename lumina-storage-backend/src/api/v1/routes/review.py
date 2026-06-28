@@ -1752,15 +1752,16 @@ async def _call_llm(prompt: str, db: AsyncSession) -> dict:
     """Gọi LLM với system prompt review, trả về parsed JSON dict."""
     from src.services.ai_model_config_service import get_default_litellm_config
 
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
+    # Phase 4 (C1): per-call params qua to_kwargs(overrides) — giữ deterministic
+    # (temperature=0, seed=42) THẮNG config, tránh collision duplicate-kwarg.
+    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs(
+        stream=False, temperature=0, seed=42,
+    )
     response = await litellm.acompletion(
         messages=[
             {"role": "system", "content": _SYSTEM_REVIEW_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        stream=False,
-        temperature=0,
-        seed=42,
         **_llm_kwargs,
     )
     return _safe_json_loads(response.choices[0].message.content or "")

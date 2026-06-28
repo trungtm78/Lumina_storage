@@ -1,9 +1,12 @@
+import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # LiteLLM requires provider-specific model string prefixes
 _LITELLM_PREFIXES: dict[str, str] = {
@@ -36,9 +39,19 @@ class LiteLLMConfig:
     api_key: str | None = None
     api_base: str | None = None
     api_version: str | None = None
+    max_tokens: int | None = None
+    temperature: float | None = None
+    # Param phụ đọc từ extra_config (top_p/seed/response_format...). Không gồm các
+    # field đã model hóa ở trên (api_version/max_tokens/temperature).
+    extra: dict = field(default_factory=dict)
 
-    def to_kwargs(self) -> dict:
-        """Subset of fields suitable for splatting into litellm/ChatLiteLLM."""
+    def to_kwargs(self, **overrides) -> dict:
+        """Kwargs để splat vào litellm/ChatLiteLLM.
+
+        Phase 4 (C1): nhận **overrides per-call merge LÊN TRÊN config — caller (vd review.py
+        truyền temperature=0, seed=42, stream=False) luôn được tôn trọng dù migrate qua Gateway.
+        Bỏ field None để giữ tương thích ngược (litellm dùng default như trước).
+        """
         kw: dict = {"model": self.model}
         if self.api_key:
             kw["api_key"] = self.api_key
@@ -46,6 +59,12 @@ class LiteLLMConfig:
             kw["api_base"] = self.api_base
         if self.api_version:
             kw["api_version"] = self.api_version
+        if self.max_tokens is not None:
+            kw["max_tokens"] = self.max_tokens
+        if self.temperature is not None:
+            kw["temperature"] = self.temperature
+        kw.update(self.extra)       # param phụ từ extra_config
+        kw.update(overrides)        # per-call overrides THẮNG
         return kw
 
 
@@ -64,17 +83,28 @@ async def get_default_litellm_config(
     """
     repo = AIModelConfigRepository(db)
     cfg = await repo.get_default_by_purpose(purpose)
+    # Phase 4 (M2): purpose 'vlm' chưa cấu hình → fallback 'chat' (KHÔNG raise) để
+    # production hiện chưa có row vlm vẫn chạy VLM extraction bằng chat model.
+    if cfg is None and purpose == "vlm":
+        logger.warning(
+            "No default AI model for purpose='vlm' — fallback sang 'chat' cho VLM extraction."
+        )
+        cfg = await repo.get_default_by_purpose("chat")
     if cfg is None:
         raise AIModelConfigNotFoundError(
             f"No default AI model configured for purpose='{purpose}'. "
             f"Admin must add one in the AI Model Config admin page."
         )
-    extra = cfg.extra_config or {}
+    extra_cfg = cfg.extra_config or {}
+    _KNOWN = {"api_version", "max_tokens", "temperature"}
     return LiteLLMConfig(
         model=build_litellm_model(cfg.provider, cfg.model_name),
         api_key=cfg.api_key,
         api_base=cfg.base_url,
-        api_version=extra.get("api_version"),
+        api_version=extra_cfg.get("api_version"),
+        max_tokens=extra_cfg.get("max_tokens"),
+        temperature=extra_cfg.get("temperature"),
+        extra={k: v for k, v in extra_cfg.items() if k not in _KNOWN},
     )
 
 

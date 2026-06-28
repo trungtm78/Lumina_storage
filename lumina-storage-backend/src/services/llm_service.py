@@ -30,10 +30,10 @@ class LLMService:
         return cls(cfg)
 
     async def stream_completion(self, messages: list[dict]) -> AsyncIterator[str]:
+        # Phase 4 (C1): stream=True qua overrides để tránh collision nếu extra_config có 'stream'.
         response = await litellm.acompletion(
             messages=messages,
-            stream=True,
-            **self._config.to_kwargs(),
+            **self._config.to_kwargs(stream=True),
         )
         async for chunk in response:
             delta = chunk.choices[0].delta.content

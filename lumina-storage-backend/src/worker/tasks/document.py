@@ -487,12 +487,13 @@ async def extract_template_task(
         from src.services.ai_model_config_service import get_default_litellm_config
 
         _llm_cfg = await get_default_litellm_config(db, "chat")
-        _llm_kwargs = _llm_cfg.to_kwargs()
+        # Phase 4 (C1): stream=False qua overrides (thắng config nếu extra_config có 'stream').
+        _llm_kwargs = _llm_cfg.to_kwargs(stream=False)
 
         # Build an llm_call function using litellm
         async def llm_call(messages, response_format=None):
             import litellm
-            kwargs = {"messages": messages, "stream": False, **_llm_kwargs}
+            kwargs = {"messages": messages, **_llm_kwargs}
             if response_format:
                 kwargs["response_format"] = response_format
             resp = await litellm.acompletion(**kwargs)
@@ -591,11 +592,12 @@ async def extract_template_draft_task(
         from src.services.ai_model_config_service import get_default_litellm_config
 
         _llm_cfg = await get_default_litellm_config(db, "chat")
-        _llm_kwargs = _llm_cfg.to_kwargs()
+        # Phase 4 (C1): stream=False qua overrides (thắng config nếu extra_config có 'stream').
+        _llm_kwargs = _llm_cfg.to_kwargs(stream=False)
 
         async def llm_call(messages, response_format=None):
             import litellm
-            kwargs = {"messages": messages, "stream": False, **_llm_kwargs}
+            kwargs = {"messages": messages, **_llm_kwargs}
             if response_format:
                 kwargs["response_format"] = response_format
             resp = await litellm.acompletion(**kwargs)

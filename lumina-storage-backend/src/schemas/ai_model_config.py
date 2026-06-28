@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, field_validator
 
-VALID_PURPOSES = {"chat", "embedding"}
+VALID_PURPOSES = {"chat", "embedding", "vlm"}
 VALID_PROVIDERS = {"azure", "openai", "anthropic", "google", "ollama"}
 
 
