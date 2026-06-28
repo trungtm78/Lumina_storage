@@ -60,7 +60,7 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     svc = ChatService(db=db, settings=get_settings())
-    await svc.delete_session(session_id=session_id)
+    await svc.delete_session(session_id=session_id, user_id=current_user.id)
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionResponse)
@@ -71,7 +71,7 @@ async def update_session(
     db: AsyncSession = Depends(get_db),
 ) -> SessionResponse:
     svc = ChatService(db=db, settings=get_settings())
-    session = await svc.update_session(session_id=session_id, title=body.title)
+    session = await svc.update_session(session_id=session_id, user_id=current_user.id, title=body.title)
     return SessionResponse.model_validate(session)
 
 
@@ -85,7 +85,7 @@ async def get_messages(
 ) -> PaginatedMessagesResponse:
     svc = ChatService(db=db, settings=get_settings())
     messages, has_more = await svc.get_history(
-        session_id=session_id, limit=limit, before_id=before
+        session_id=session_id, user_id=current_user.id, limit=limit, before_id=before
     )
     items = []
     for m in messages:
@@ -124,6 +124,8 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     svc = ChatService(db=db, settings=get_settings())
+    # Chặn IDOR TRƯỚC khi mở stream → trả 404 sạch thay vì lỗi giữa luồng SSE.
+    await svc.assert_owned(session_id, current_user.id)
     return StreamingResponse(
         _agent_event_stream(svc, session_id, body, current_user),
         media_type="text/event-stream",

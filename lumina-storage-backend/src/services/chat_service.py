@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.config import Settings
+from src.core.exceptions import NotFoundError
 from src.core.langfuse import get_langfuse_handler
 from src.models.chat import ChatMessage, ChatMessageSource, ChatSession
 from src.models.user import User
@@ -169,21 +170,37 @@ class ChatService:
         has_more = len(rows) > limit
         return rows[:limit], has_more
 
+    async def assert_owned(self, session_id: uuid.UUID, user_id: uuid.UUID) -> ChatSession:
+        """Trả session nếu thuộc user; raise NotFoundError (→404) nếu không tồn tại
+        hoặc không thuộc user. Chống IDOR — không lộ sự tồn tại của session người khác."""
+        session = await self.db.get(ChatSession, session_id)
+        if session is None or session.user_id != user_id or session.deleted_at is not None:
+            raise NotFoundError("Session not found")
+        return session
+
     async def get_history(
         self,
         session_id: uuid.UUID,
+        user_id: uuid.UUID,
         limit: int = 50,
         before_id: uuid.UUID | None = None,
     ) -> tuple[list[ChatMessage], bool]:
+        await self.assert_owned(session_id, user_id)
         q = (
             select(ChatMessage)
             .where(ChatMessage.session_id == session_id)
             .options(selectinload(ChatMessage.sources).selectinload(ChatMessageSource.document))
         )
         if before_id:
-            before_msg = await self.db.get(ChatMessage, before_id)
-            if before_msg:
-                q = q.where(ChatMessage.created_at < before_msg.created_at)
+            # Cursor phải thuộc cùng session (chống cursor xuyên session).
+            cur = await self.db.execute(
+                select(ChatMessage.created_at).where(
+                    ChatMessage.id == before_id, ChatMessage.session_id == session_id
+                )
+            )
+            before_ts = cur.scalar_one_or_none()
+            if before_ts is not None:
+                q = q.where(ChatMessage.created_at < before_ts)
         q = q.order_by(ChatMessage.created_at.desc()).limit(limit + 1)
         result = await self.db.execute(q)
         rows = list(result.scalars().all())
@@ -192,7 +209,8 @@ class ChatService:
         rows.reverse()  # oldest first for display
         return rows, has_more
 
-    async def delete_session(self, session_id: uuid.UUID) -> None:
+    async def delete_session(self, session_id: uuid.UUID, user_id: uuid.UUID) -> None:
+        await self.assert_owned(session_id, user_id)
         # Collect document IDs from attachments and skill results in this session
         from src.models.document import Document as DocModel
         messages = await self.db.execute(
@@ -229,9 +247,9 @@ class ChatService:
 
         await self.db.commit()
 
-    async def update_session(self, session_id: uuid.UUID, title: str | None) -> ChatSession:
-        session = await self.db.get(ChatSession, session_id)
-        if session and title is not None:
+    async def update_session(self, session_id: uuid.UUID, user_id: uuid.UUID, title: str | None) -> ChatSession:
+        session = await self.assert_owned(session_id, user_id)
+        if title is not None:
             session.title = title
             await self.db.commit()
             await self.db.refresh(session)
@@ -284,6 +302,7 @@ class ChatService:
         document_ids: list[uuid.UUID] | None = None,
         model_id: uuid.UUID | None = None,
     ) -> AsyncIterator[str]:
+        await self.assert_owned(session_id, current_user.id)
         # 1. Save user message
         user_msg = ChatMessage(session_id=session_id, role="user", content=user_message)
         self.db.add(user_msg)
@@ -322,7 +341,7 @@ class ChatService:
         context = "\n\n".join(context_parts) if context_parts else "Không có context liên quan."
 
         # 5. Build Langchain history
-        history_msgs, _ = await self.get_history(session_id)
+        history_msgs, _ = await self.get_history(session_id, current_user.id)
         lc_history = []
         for msg in history_msgs:
             if msg.role == "user":
@@ -424,6 +443,7 @@ class ChatService:
         model_id: uuid.UUID | None = None,
     ) -> AsyncIterator[dict]:
         """Stream agent responses using LangGraph ReAct agent with tools."""
+        await self.assert_owned(session_id, current_user.id)
 
         # 1. Save user message with attachments
         attachment_data = None
@@ -447,7 +467,7 @@ class ChatService:
         await self.db.flush()
 
         # 2. Load history
-        history_msgs, _ = await self.get_history(session_id)
+        history_msgs, _ = await self.get_history(session_id, current_user.id)
         lc_history = convert_history(history_msgs)
 
         # 3. Resolve LLM model (native LangChain, not LiteLLM)
