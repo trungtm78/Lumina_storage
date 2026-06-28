@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-SCAN_DIRS = ("api", "worker", "services")
+SCAN_DIRS = ("api", "worker", "services", "ai")  # Phase 4 M6: phủ cả src/ai/ (gateway)
 
 # Marker hợp lệ (so khớp case-insensitive): comment giải thích commit là boundary/
 # checkpoint/cố ý (Phase 3 convention).
