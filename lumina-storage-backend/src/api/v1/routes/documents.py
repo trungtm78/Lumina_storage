@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime
 
@@ -27,6 +28,16 @@ from src.models.core import AuditLog
 from src.services.document import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+logger = logging.getLogger(__name__)
+
+
+async def _enqueue_thumbnail(arq_pool: ArqRedis, doc_id: uuid.UUID) -> None:
+    """Phase 3 T4: enqueue thumbnail là best-effort — lỗi Redis KHÔNG làm hỏng upload."""
+    try:
+        await arq_pool.enqueue_job("generate_thumbnail_task", doc_id)
+    except Exception:
+        logger.warning("enqueue generate_thumbnail_task failed for %s (recoverable)", doc_id, exc_info=True)
 
 
 async def _audit(
@@ -126,10 +137,12 @@ async def upload_files(
     db: AsyncSession = Depends(get_db),
 ) -> list[DocumentResponse]:
     docs = await svc.upload_files(files, folder_id, current_user, storage_config_id, source_type=source_type)
+    # Phase 3 T4 — COMMIT TRƯỚC ENQUEUE: doc phải bền để worker thumbnail/ingest thấy.
+    await db.commit()
     arq_pool = get_arq_pool(request)
     for doc in docs:
         await _audit(db, current_user.id, "document.upload", doc.id)
-        await arq_pool.enqueue_job("generate_thumbnail_task", doc.id)
+        await _enqueue_thumbnail(arq_pool, doc.id)
         await dispatch_task(
             arq_pool=arq_pool,
             func_name="ingest_document_task",
@@ -167,10 +180,12 @@ async def upload_folder(
     db: AsyncSession = Depends(get_db),
 ) -> DocumentUploadResponse:
     result = await svc.upload_folder(files, paths, parent_folder_id, current_user, storage_config_id)
+    # Phase 3 T4 — COMMIT TRƯỚC ENQUEUE: doc phải bền để worker thumbnail/ingest thấy.
+    await db.commit()
     arq_pool = get_arq_pool(request)
     for doc in result.documents:
         await _audit(db, current_user.id, "document.upload", doc.id)
-        await arq_pool.enqueue_job("generate_thumbnail_task", doc.id)
+        await _enqueue_thumbnail(arq_pool, doc.id)
         await dispatch_task(
             arq_pool=arq_pool,
             func_name="ingest_document_task",

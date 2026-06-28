@@ -415,9 +415,19 @@ class DocumentService:
         self, doc_ids: list[uuid.UUID], owner: User, arq_pool
     ) -> int:
         docs = await self.doc_repo.get_deleted_by_ids(doc_ids, owner.id)
+        deleted = 0
         for doc in docs:
-            await self._permanent_delete_and_dispatch(doc, arq_pool)
-        return len(docs)
+            # Phase 3 T4: mỗi doc là một đơn vị xóa-vĩnh-viễn ĐỘC LẬP (commit riêng) →
+            # lỗi 1 doc KHÔNG làm hỏng cả batch hay che giấu phần đã xóa.
+            try:
+                await self._permanent_delete_and_dispatch(doc, arq_pool)
+                deleted += 1
+            except Exception:
+                logger.warning("bulk_permanent_delete: failed for %s — skipping", doc.id, exc_info=True)
+                # Lỗi TRƯỚC commit nội bộ → session ở trạng thái failed; phải rollback để
+                # các doc kế tiếp KHÔNG chạy trên session poisoned (PendingRollbackError).
+                await self.doc_repo.session.rollback()
+        return deleted
 
     async def _soft_delete_related_templates(self, doc_id: uuid.UUID) -> None:
         """Soft-delete any template documents derived from this source document."""
@@ -441,8 +451,14 @@ class DocumentService:
         # tránh partial-commit nếu bước sau lỗi.
         await session.flush()
 
-    async def _permanent_delete_related_templates(self, doc_id, session, arq_pool) -> None:
-        """Hard-delete any template documents derived from this source document."""
+    async def _permanent_delete_related_templates(self, doc_id, session) -> list[tuple]:
+        """Hard-delete templates derived from doc_id; flush-only.
+
+        Phase 3 T4: KHÔNG commit/enqueue ở đây — trả về payload cleanup storage để CALLER
+        commit MỘT LẦN (cùng transaction với xóa doc cha) rồi enqueue, giữ tính nguyên tử
+        + commit-trước-enqueue. (Trước đây commit từng template làm commit ké việc xóa
+        BackgroundTask của doc cha → partial-commit nếu bước sau lỗi.)
+        """
         from sqlalchemy import select as sql_select
 
         result = await session.execute(
@@ -452,21 +468,12 @@ class DocumentService:
             )
         )
         templates = list(result.scalars().all())
+        payloads: list[tuple] = []
         for tmpl in templates:
-            tmpl_file_path = tmpl.file_path
-            tmpl_storage_config_id = tmpl.storage_config_id
-            tmpl_id = tmpl.id
+            payloads.append((tmpl.id, tmpl.storage_config_id, tmpl.file_path))
             await session.delete(tmpl)
-            await session.flush()
-            # Cleanup storage file
-            await arq_pool.enqueue_job(
-                "cleanup_deleted_document_task",
-                tmpl_id,
-                tmpl_storage_config_id,
-                tmpl_file_path,
-                None,  # no thumbnail
-                [],    # no versions
-            )
+        await session.flush()
+        return payloads
 
     async def _permanent_delete_and_dispatch(self, doc, arq_pool) -> None:
         from sqlalchemy import delete as sql_delete, select as sql_select
@@ -514,41 +521,62 @@ class DocumentService:
         except Exception as e:
             logger.warning("_permanent_delete_and_dispatch: Qdrant delete failed for %s: %s", doc_id, e)
 
-        # Hard delete related templates first
-        await self._permanent_delete_related_templates(doc_id, session, arq_pool)
+        # Hard delete related templates first (flush-only, thu payload cleanup)
+        tmpl_payloads = await self._permanent_delete_related_templates(doc_id, session)
 
         # Hard delete — CASCADE tự xóa:
         # DocumentTag, DocumentVersion, DocumentContent, DocumentChunk
         await session.delete(doc)
         await session.flush()
+        # Phase 3 T4 — COMMIT MỘT LẦN (nguyên tử): BackgroundTask + templates + doc cùng
+        # một đơn vị xóa; commit TRƯỚC khi enqueue cleanup storage (file chỉ xóa sau khi DB
+        # đã bền — tránh xóa file khi DB delete có thể rollback).
+        await session.commit()
 
-        # Dispatch worker chỉ để xóa storage files
-        await arq_pool.enqueue_job(
-            "cleanup_deleted_document_task",
-            doc_id,
-            storage_config_id,
-            file_path,
-            image_thumbnail,
-            version_file_paths,
+        # Dispatch worker xóa storage files SAU commit (best-effort: enqueue lỗi không hỏng delete)
+        cleanup_jobs = [
+            (tid, cfg, path, None, [])
+            for (tid, cfg, path) in tmpl_payloads
+        ]
+        cleanup_jobs.append(
+            (doc_id, storage_config_id, file_path, image_thumbnail, version_file_paths)
         )
+        for cid, ccfg, cpath, cthumb, cversions in cleanup_jobs:
+            try:
+                await arq_pool.enqueue_job(
+                    "cleanup_deleted_document_task", cid, ccfg, cpath, cthumb, cversions,
+                )
+            except Exception:
+                logger.warning("enqueue cleanup_deleted_document_task failed for %s (recoverable)", cid, exc_info=True)
 
         # Template cascade: if deleting a template leaves its source with no
         # remaining templates, hard-delete the source upload too.
+        # Phase 3 T4 — cascade là ĐƠN VỊ XÓA ĐỘC LẬP, chạy SAU commit của doc hiện tại:
+        # doc user vừa xóa đã bền (đúng ý), cascade chỉ dọn source mồ côi (best-effort).
+        # Lỗi cascade KHÔNG được làm hỏng/poison delete chính → wrap + rollback để khôi phục
+        # session cho caller (bulk).
         if source_doc_id is not None:
-            remaining = await session.execute(
-                sql_select(Document.id).where(
-                    Document.source_type == "template",
-                    Document.deleted_at.is_(None),
-                    Document.source_metadata["source_document_id"].astext == str(source_doc_id),
-                )
-            )
-            if remaining.first() is None:
-                source_doc = await session.get(Document, source_doc_id)
-                if source_doc and source_doc.deleted_at is None:
-                    logger.info(
-                        "Cascade-deleting source upload %s (no templates remain)", source_doc_id,
+            try:
+                remaining = await session.execute(
+                    sql_select(Document.id).where(
+                        Document.source_type == "template",
+                        Document.deleted_at.is_(None),
+                        Document.source_metadata["source_document_id"].astext == str(source_doc_id),
                     )
-                    await self._permanent_delete_and_dispatch(source_doc, arq_pool)
+                )
+                if remaining.first() is None:
+                    source_doc = await session.get(Document, source_doc_id)
+                    if source_doc and source_doc.deleted_at is None:
+                        logger.info(
+                            "Cascade-deleting source upload %s (no templates remain)", source_doc_id,
+                        )
+                        await self._permanent_delete_and_dispatch(source_doc, arq_pool)
+            except Exception:
+                logger.warning(
+                    "Cascade-delete source upload %s failed (doc đã xóa OK) — source còn lại, recoverable",
+                    source_doc_id, exc_info=True,
+                )
+                await session.rollback()
 
     async def move_document(
         self, doc_id: uuid.UUID, folder_id: uuid.UUID | None, owner: User

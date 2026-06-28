@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Request
@@ -13,6 +14,8 @@ from src.worker.dispatch import dispatch_task
 
 router = APIRouter(prefix="/google-drive", tags=["google-drive"])
 
+logger = logging.getLogger(__name__)
+
 
 def _svc(db: AsyncSession = Depends(get_db)) -> GoogleDriveService:
     return GoogleDriveService(db)
@@ -27,6 +30,8 @@ async def import_from_drive(
     db: AsyncSession = Depends(get_db),
 ) -> list[GoogleDriveImportResponse]:
     results = await svc.import_from_url(data.url, data.folder_id, current_user)
+    # Phase 3 T4 — COMMIT TRƯỚC ENQUEUE: document import phải bền để worker thấy.
+    await db.commit()
     arq_pool = get_arq_pool(request)
     for result in results:
         if result.document_id is None:
@@ -37,7 +42,10 @@ async def import_from_drive(
             resource_type="document",
             resource_id=result.document_id,
         ))
-        await arq_pool.enqueue_job("generate_thumbnail_task", result.document_id)
+        try:
+            await arq_pool.enqueue_job("generate_thumbnail_task", result.document_id)
+        except Exception:
+            logger.warning("enqueue generate_thumbnail_task failed for %s (recoverable)", result.document_id, exc_info=True)
         await dispatch_task(
             arq_pool=arq_pool,
             func_name="ingest_document_task",
