@@ -12,6 +12,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 from src.core.config import get_settings
+from src.core.encryption import decrypt_config_secrets
 from src.models.storage import StorageConfig
 
 
@@ -187,7 +188,9 @@ class S3StorageBackend(StorageBackend):
 
 def get_storage_backend(config: StorageConfig) -> StorageBackend:
     """Create a StorageBackend from a StorageConfig model."""
-    cfg = config.config or {}
+    # Secret S3 (access_key/secret_key) được lưu mã hóa trong JSONB → giải mã
+    # ngay trước khi dựng backend. Field không phải secret giữ nguyên.
+    cfg = decrypt_config_secrets(config.config or {})
 
     if config.backend_type == "local":
         # Default "uploads" matches the docker-compose volume mount. Admin can

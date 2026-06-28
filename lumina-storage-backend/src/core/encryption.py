@@ -90,11 +90,85 @@ def is_encrypted(value: str) -> bool:
     return isinstance(value, str) and value.startswith(_ENCRYPTED_PREFIX)
 
 
+_MASK_CHAR = "•"
+
+
 def mask_value(value: str) -> str:
     """Return masked version of a secret value for UI display."""
     if not value:
         return ""
     plain = decrypt_value(value) if is_encrypted(value) else value
     if len(plain) <= 4:
-        return "•" * len(plain)
-    return plain[:2] + "•" * (len(plain) - 4) + plain[-2:]
+        return _MASK_CHAR * len(plain)
+    return plain[:2] + _MASK_CHAR * (len(plain) - 4) + plain[-2:]
+
+
+def is_masked(value: object) -> bool:
+    """True nếu value là chuỗi đã bị mask (chứa bullet) — dùng để phát hiện
+    secret round-trip từ FE (đã redact) nhằm không ghi đè giá trị thật."""
+    return isinstance(value, str) and _MASK_CHAR in value
+
+
+# --- Field-level encryption cho secret nằm trong JSONB ---
+#
+# EncryptedString (TypeDecorator) chỉ áp được cho cột vô hướng. Secret S3 của
+# StorageConfig nằm nested trong cột JSONB `config` nên phải mã hóa từng field.
+
+# Các field trong StorageConfig.config được coi là secret (S3/MinIO credentials).
+STORAGE_SECRET_FIELDS: tuple[str, ...] = ("access_key", "secret_key")
+
+
+def encrypt_config_secrets(
+    config: dict | None, fields: tuple[str, ...] = STORAGE_SECRET_FIELDS
+) -> dict | None:
+    """Trả bản COPY của config với các field secret đã mã hóa ('enc:...').
+
+    Idempotent (encrypt_value bỏ qua giá trị đã 'enc:'). None/empty → trả as-is.
+    Không mutate input.
+    """
+    if not config:
+        return config
+    result = dict(config)
+    for f in fields:
+        v = result.get(f)
+        if isinstance(v, str) and v:
+            result[f] = encrypt_value(v)
+    return result
+
+
+def decrypt_config_secrets(
+    config: dict | None, fields: tuple[str, ...] = STORAGE_SECRET_FIELDS
+) -> dict | None:
+    """Trả bản COPY của config với các field secret đã giải mã. Không mutate input."""
+    if not config:
+        return config
+    result = dict(config)
+    for f in fields:
+        v = result.get(f)
+        if isinstance(v, str) and v:
+            result[f] = decrypt_value(v)
+    return result
+
+
+# Sentinel redact response: ẩn HOÀN TOÀN secret (không lộ nội dung lẫn độ dài).
+# Chứa _MASK_CHAR nên is_masked() nhận diện được khi FE round-trip → giữ secret gốc.
+# Khác mask_value (lộ 2 ký tự đầu/cuối + độ dài) — secret thật không được lộ một phần.
+_REDACTED = _MASK_CHAR * 8
+
+
+def redact_config_secrets(
+    config: dict | None, fields: tuple[str, ...] = STORAGE_SECRET_FIELDS
+) -> dict | None:
+    """Trả bản COPY của config với các field secret được thay bằng sentinel redact.
+
+    Chỉ redact field có giá trị (truthy) → FE vẫn phân biệt được 'đã đặt' (sentinel)
+    với 'chưa đặt' (vắng/rỗng). Không mutate input.
+    """
+    if not config:
+        return config
+    result = dict(config)
+    for f in fields:
+        v = result.get(f)
+        if isinstance(v, str) and v:
+            result[f] = _REDACTED
+    return result

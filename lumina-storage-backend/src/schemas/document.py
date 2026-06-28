@@ -13,7 +13,9 @@ class ProcessStatusResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from src.core.encryption import redact_config_secrets
 
 
 # --- StorageConfig ---
@@ -51,6 +53,13 @@ class StorageConfigResponse(BaseModel):
     owner_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("config", mode="before")
+    @classmethod
+    def _redact_secrets(cls, v: dict) -> dict:
+        """Mask secret S3 (access_key/secret_key) — không lộ plaintext lẫn ciphertext
+        thô trong response. Áp cho mọi response path qua schema (atomic)."""
+        return redact_config_secrets(v) if isinstance(v, dict) else v
 
 
 # --- Folder ---
