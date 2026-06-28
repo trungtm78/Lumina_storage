@@ -38,6 +38,11 @@ _PPTX_EXTRACT_PROMPT = """Bạn là công cụ extract nội dung slide thành M
 
 
 class TextExtractionService:
+    # Phase 4 T2 (M1): default max_tokens cho VLM ĐẶT Ở lớp tiêu thụ (không ở config
+    # resolver). 8192 vì 1 trang A4 tiếng Việt dày + bảng + mô tả ảnh có thể vượt 4096
+    # token markdown → tránh output cắt cụt. Override được qua vlm_kwargs/extra_config.
+    _VLM_DEFAULT_MAX_TOKENS = 8192
+
     def __init__(
         self,
         gotenberg_url: str = "",
@@ -46,7 +51,9 @@ class TextExtractionService:
     ) -> None:
         self._gotenberg_url = gotenberg_url
         self._vlm_model = vlm_model
-        self._vlm_kwargs = vlm_kwargs or {}
+        # Copy để KHÔNG mutate dict của caller; đảm bảo LUÔN có max_tokens đủ lớn.
+        self._vlm_kwargs = dict(vlm_kwargs or {})
+        self._vlm_kwargs.setdefault("max_tokens", self._VLM_DEFAULT_MAX_TOKENS)
 
     async def extract(
         self, file_bytes: bytes, mime_type: str, extension: str

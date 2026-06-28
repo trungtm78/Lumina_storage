@@ -85,11 +85,13 @@ async def get_default_litellm_config(
     cfg = await repo.get_default_by_purpose(purpose)
     # Phase 4 (M2): purpose 'vlm' chưa cấu hình → fallback 'chat' (KHÔNG raise) để
     # production hiện chưa có row vlm vẫn chạy VLM extraction bằng chat model.
+    fell_back = False
     if cfg is None and purpose == "vlm":
         logger.warning(
             "No default AI model for purpose='vlm' — fallback sang 'chat' cho VLM extraction."
         )
         cfg = await repo.get_default_by_purpose("chat")
+        fell_back = True
     if cfg is None:
         raise AIModelConfigNotFoundError(
             f"No default AI model configured for purpose='{purpose}'. "
@@ -97,13 +99,21 @@ async def get_default_litellm_config(
         )
     extra_cfg = cfg.extra_config or {}
     _KNOWN = {"api_version", "max_tokens", "temperature"}
+    max_tokens = extra_cfg.get("max_tokens")
+    temperature = extra_cfg.get("temperature")
+    if fell_back:
+        # /codex T2 P2: param SINH (max_tokens/temperature) của chat config KHÔNG phù hợp
+        # VLM — chat max_tokens thấp (vd 2048) sẽ làm VLM cắt cụt. Bỏ để lớp tiêu thụ VLM
+        # áp default riêng (text_extraction 8192). Giữ connection params (model/key/base).
+        max_tokens = None
+        temperature = None
     return LiteLLMConfig(
         model=build_litellm_model(cfg.provider, cfg.model_name),
         api_key=cfg.api_key,
         api_base=cfg.base_url,
         api_version=extra_cfg.get("api_version"),
-        max_tokens=extra_cfg.get("max_tokens"),
-        temperature=extra_cfg.get("temperature"),
+        max_tokens=max_tokens,
+        temperature=temperature,
         extra={k: v for k, v in extra_cfg.items() if k not in _KNOWN},
     )
 

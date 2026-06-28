@@ -189,9 +189,10 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                 # ── Normal path (PDF, PPTX, DOCX, images, ...) ──────────────
                 from src.services.ai_model_config_service import get_default_litellm_config
 
-                # VLM extraction reuses the chat model (multimodal models like
-                # gpt-4o handle both text chat and image/PDF understanding).
-                vlm_cfg = await get_default_litellm_config(db, "chat")
+                # Phase 4 T2: dùng purpose 'vlm' (fallback 'chat' nếu admin chưa cấu hình vlm
+                # — get_default_litellm_config xử lý no-raise). Cho phép cấu hình model + max_tokens
+                # riêng cho VLM (vd multimodal gpt-4o với max_tokens lớn cho trang dày).
+                vlm_cfg = await get_default_litellm_config(db, "vlm")
                 vlm_model = vlm_cfg.model
                 vlm_kwargs: dict = {k: v for k, v in vlm_cfg.to_kwargs().items() if k != "model"}
 

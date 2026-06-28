@@ -106,7 +106,17 @@ async def test_vlm_falls_back_to_chat_without_raising(db_session):
     await _add_config(db_session, "chat", is_default=True, extra={"max_tokens": 2048})
     cfg = await get_default_litellm_config(db_session, "vlm")
     assert cfg.model.endswith("gpt-4o")
-    assert cfg.max_tokens == 2048
+    # /codex T2 P2: max_tokens (+temperature) thấp của CHAT bị BỎ khi fallback → để
+    # lớp tiêu thụ VLM (text_extraction) áp default 8192, tránh cắt cụt.
+    assert cfg.max_tokens is None and cfg.temperature is None
+
+
+@pytest.mark.asyncio
+async def test_real_vlm_config_keeps_its_max_tokens(db_session):
+    # Có config vlm THẬT → giữ nguyên max_tokens cấu hình (không bị bỏ như fallback).
+    await _add_config(db_session, "vlm", is_default=True, extra={"max_tokens": 16000})
+    cfg = await get_default_litellm_config(db_session, "vlm")
+    assert cfg.max_tokens == 16000
 
 
 # ── VALID_PURPOSES ───────────────────────────────────────────────────────────
