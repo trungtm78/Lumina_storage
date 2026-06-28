@@ -1,0 +1,41 @@
+{
+  "app_id": "document-analysis",
+  "name": "document-analysis",
+  "version": "1.0.0",
+  "description": "Phân tích tài liệu chuyên sâu (hợp đồng, hóa đơn, CV, báo cáo). Hỗ trợ so sánh 2 tài liệu. Xuất báo cáo PDF với rủi ro, cảnh báo, khuyến nghị.",
+  "description_short": "Phân tích tài liệu chuyên sâu (hợp đồng, hóa đơn, CV, báo cáo). Hỗ trợ so sánh 2 tài liệu. Xuất báo cáo PDF với rủi ro, cảnh báo, khuyến nghị.",
+  "category": "Analytics",
+  "company": {
+    "name": "Lumina Technology JSC",
+    "website": "https://lumina.io",
+    "support_email": "support@lumina.io"
+  },
+  "target": {
+    "systems": [
+      "core",
+      "storage"
+    ],
+    "modules": [
+      "chat"
+    ],
+    "min_version": "2.0.0"
+  },
+  "dependencies": [],
+  "permissions": [
+    "read:documents"
+  ],
+  "auto_activate": false,
+  "is_active": false,
+  "triggers": {
+    "keywords": [
+      "phân tích",
+      "review",
+      "đánh giá",
+      "rà soát",
+      "kiểm tra",
+      "so sánh",
+      "compare",
+      "analyze"
+    ]
+  }
+}

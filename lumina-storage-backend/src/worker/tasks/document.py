@@ -1,0 +1,574 @@
+import logging
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import delete, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.config import get_settings
+from src.models.document import Document, DocumentChunk, DocumentContent
+from src.models.processing import BackgroundTask
+from src.repositories.document import StorageConfigRepository
+from src.services.embedding_service import EmbeddingService
+from src.services.storage import get_storage_backend
+from src.services.template_service import extract_template, extract_template_draft
+from src.services.text_extraction_service import TextExtractionService
+from src.services.vector_service import ChunkPoint, VectorService
+
+logger = logging.getLogger(__name__)
+
+
+async def cleanup_deleted_document_task(
+    ctx: dict,
+    document_id: uuid.UUID,
+    storage_config_id: uuid.UUID,
+    file_path: str,
+    image_thumbnail: str | None,
+    version_file_paths: list[str],
+) -> dict:
+    """Xóa storage files của document đã bị hard-delete khỏi DB.
+    Qdrant đã được xóa đồng bộ trước khi DB delete.
+    Không cần DB session vì document đã xóa rồi.
+    """
+    settings = get_settings()
+    deleted = {"storage_files": [], "errors": []}
+
+    # Xóa files trên storage
+    try:
+        storage_repo_session = ctx.get("session_factory")
+        # Dùng session riêng chỉ để load storage config
+        async with storage_repo_session() as db:
+            storage_repo = StorageConfigRepository(db)
+            config = await storage_repo.get_by_id(storage_config_id)
+
+        if config:
+            backend = get_storage_backend(config)
+            all_files = [file_path] + ([image_thumbnail] if image_thumbnail else []) + version_file_paths
+            for path in all_files:
+                try:
+                    await backend.delete(path)
+                    deleted["storage_files"].append(path)
+                except Exception as e:
+                    logger.warning("cleanup_deleted_document_task: storage delete failed for %s: %s", path, e)
+                    deleted["errors"].append(f"storage:{path}: {e}")
+    except Exception as e:
+        logger.warning("cleanup_deleted_document_task: storage backend init failed: %s", e)
+        deleted["errors"].append(f"storage_init: {e}")
+
+    return deleted
+
+
+async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.UUID) -> dict:
+    session_factory = ctx["session_factory"]
+
+    async with session_factory() as db:
+        db: AsyncSession
+        try:
+            # 1. Fetch BackgroundTask + Document
+            bg_task = await db.get(BackgroundTask, task_id)
+            if bg_task is None:
+                return {"error": "BackgroundTask not found"}
+
+            document = await db.get(Document, document_id)
+            if document is None:
+                bg_task.status = "failure"
+                bg_task.error_message = "Document not found"
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                return {"error": "Document not found"}
+
+            # 2. Mark running
+            bg_task.status = "running"
+            bg_task.started_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            settings = get_settings()
+
+            embedding_svc: EmbeddingService = await EmbeddingService.from_db_default(db)
+            vector_svc: VectorService = VectorService(settings)
+
+            # 3. Read file bytes from storage backend
+            storage_repo = StorageConfigRepository(db)
+            storage_config = await storage_repo.get_by_id(document.storage_config_id)
+            if not storage_config:
+                raise RuntimeError(f"Storage config {document.storage_config_id} not found")
+
+            backend = get_storage_backend(storage_config)
+            file_bytes = await backend.read(document.file_path)
+
+            # 4. Extract text — separate path for Excel/CSV (RAGFlow style)
+            _EXCEL_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+
+            if document.extension in _EXCEL_EXTENSIONS:
+                # ── Excel/CSV path ───────────────────────────────────────────
+                # Bypass TextExtractionService entirely.
+                # excel_rag_service handles: magic byte detection, fallback chain
+                # (openpyxl → pandas → calamine), merged cells, multi-level headers,
+                # bold hierarchy detection. Returns 1 PageResult per data row.
+                from src.services.excel_rag_service import parse_xlsx_to_page_results
+                pages = parse_xlsx_to_page_results(file_bytes)
+                logger.info(
+                    "[extract] Excel/CSV document_id=%s ext=%s → %d row chunk(s) across %d sheet(s)",
+                    document_id, document.extension, len(pages),
+                    len({p.page_number for p in pages}),
+                )
+            else:
+                # ── Normal path (PDF, PPTX, DOCX, images, ...) ──────────────
+                from src.services.ai_model_config_service import get_default_litellm_config
+
+                # VLM extraction reuses the chat model (multimodal models like
+                # gpt-4o handle both text chat and image/PDF understanding).
+                vlm_cfg = await get_default_litellm_config(db, "chat")
+                vlm_model = vlm_cfg.model
+                vlm_kwargs: dict = {k: v for k, v in vlm_cfg.to_kwargs().items() if k != "model"}
+
+                extractor = TextExtractionService(
+                    gotenberg_url=settings.gotenberg_url,
+                    vlm_model=vlm_model,
+                    vlm_kwargs=vlm_kwargs,
+                )
+                pages = await extractor.extract(file_bytes, document.mime_type, document.extension)
+                logger.info(
+                    "[extract] document_id=%s mime=%s ext=%s → %d page(s)",
+                    document_id, document.mime_type, document.extension, len(pages),
+                )
+                for p in pages:
+                    logger.info(
+                        "[extract]   page_number=%s  chars=%d\n%s",
+                        p.page_number, len(p.text), p.text,
+                    )
+
+            if not pages:
+                document.page_count = 0
+                bg_task.status = "success"
+                bg_task.result = {"page_count": 0, "chunk_count": 0, "skipped": True}
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+                return bg_task.result
+
+            # 5. Upsert DocumentContent (raw_text = joined markdown)
+            full_markdown = "\n\n".join(p.text for p in pages)
+            existing_content = await db.get(DocumentContent, document_id)
+            if existing_content:
+                existing_content.raw_text = full_markdown
+            else:
+                db.add(DocumentContent(document_id=document_id, raw_text=full_markdown))
+            await db.flush()
+
+            # 6. Populate search_vector for FTS — unaccent so 'nhân viên' matches 'nhan vien'
+            await db.execute(
+                text(
+                    "UPDATE documents_documentcontent "
+                    "SET search_vector = to_tsvector('simple', unaccent(raw_text)) "
+                    "WHERE document_id = :id"
+                ),
+                {"id": str(document_id)},
+            )
+
+            # 7. Delete old chunks + vectors
+            await vector_svc.delete_by_document(document_id)
+            await db.execute(
+                delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+            )
+            await db.flush()
+
+            # 8. Chunking strategy:
+            #    - Excel/CSV → already 1 row per PageResult, no splitting needed
+            #    - 1 page (txt/md/docx)  → chunk by markdown section
+            #    - nhiều page (pdf/pptx) → 1 page = 1 chunk (fallback split nếu page > 24000 chars)
+            from langchain_core.documents import Document as LCDocument
+            from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+            final_chunks: list[tuple] = []  # (LangChain doc, page_number)
+
+            if document.extension in _EXCEL_EXTENSIONS:
+                # Excel/CSV: each PageResult is already 1 row chunk — use directly, no splitting
+                for page in pages:
+                    final_chunks.append((LCDocument(page_content=page.text), page.page_number))
+                logger.info("[chunking] Excel/CSV → %d row chunk(s) (1 row = 1 chunk)", len(final_chunks))
+            elif len(pages) == 1:
+                # Single-page document: chunk by section, then sentence-split inside each
+                # section so Vietnamese sentence boundaries (?/!/…/abbreviations) are honored.
+                from src.services.text_chunking import chunk_by_sentences
+
+                md_splitter = MarkdownHeaderTextSplitter(
+                    headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")],
+                    strip_headers=False,
+                )
+                header_splits = md_splitter.split_text(pages[0].text)
+                section_chunks = []
+                for section in header_splits:
+                    pieces = chunk_by_sentences(section.page_content, chunk_size=1500, chunk_overlap=150)
+                    for piece in pieces:
+                        section_chunks.append(LCDocument(page_content=piece, metadata=section.metadata))
+                for chunk in section_chunks:
+                    final_chunks.append((chunk, pages[0].page_number))
+                logger.info("[chunking] single-page → %d section chunk(s) (VN sentence-aware)", len(section_chunks))
+            else:
+                # Multi-page document: 1 page = 1 chunk
+                # XLSX sheets có thể là bảng rất lớn → chunk theo row groups
+                import re as _re
+
+                def _split_table_by_rows(text: str, max_chars: int = 12000) -> list[str]:
+                    """Split markdown table thành chunks theo char limit, mỗi chunk giữ header."""
+                    lines = text.splitlines()
+                    header_lines: list[str] = []
+                    data_lines: list[str] = []
+                    found_separator = False
+                    for line in lines:
+                        if not found_separator:
+                            header_lines.append(line)
+                            if _re.match(r"^\|[\s\-:|]+\|", line):
+                                found_separator = True
+                        else:
+                            if line.strip():
+                                data_lines.append(line)
+                    if not data_lines or not found_separator:
+                        return [text]
+                    header = "\n".join(header_lines)
+                    chunks: list[str] = []
+                    current_rows: list[str] = []
+                    current_len = len(header)
+                    for row in data_lines:
+                        if current_rows and current_len + len(row) + 1 > max_chars:
+                            chunks.append(header + "\n" + "\n".join(current_rows))
+                            current_rows = []
+                            current_len = len(header)
+                        current_rows.append(row)
+                        current_len += len(row) + 1
+                    if current_rows:
+                        chunks.append(header + "\n" + "\n".join(current_rows))
+                    return chunks or [text]
+
+                def _is_table_heavy(text: str) -> bool:
+                    """True nếu text chủ yếu là markdown table."""
+                    table_lines = sum(1 for line in text.splitlines() if line.startswith("|"))
+                    return table_lines > 10 and table_lines / max(len(text.splitlines()), 1) > 0.5
+
+                from src.services.text_chunking import chunk_by_sentences as _vi_chunk
+
+                for page in pages:
+                    if len(page.text) <= 24000:
+                        final_chunks.append((LCDocument(page_content=page.text), page.page_number))
+                        logger.info("[chunking] page_number=%s → 1 chunk (%d chars)", page.page_number, len(page.text))
+                    elif _is_table_heavy(page.text):
+                        table_chunks = _split_table_by_rows(page.text)
+                        for chunk_text in table_chunks:
+                            final_chunks.append((LCDocument(page_content=chunk_text), page.page_number))
+                        logger.info("[chunking] page_number=%s → %d row-group chunks (table, %d chars)", page.page_number, len(table_chunks), len(page.text))
+                    else:
+                        # Vietnamese-aware split for long prose pages
+                        splits = _vi_chunk(page.text, chunk_size=24000, chunk_overlap=500)
+                        for chunk_text in splits:
+                            final_chunks.append((LCDocument(page_content=chunk_text), page.page_number))
+                        logger.info("[chunking] page_number=%s → %d chunks (VN-aware fallback, %d chars)", page.page_number, len(splits), len(page.text))
+
+            logger.info(
+                "[chunking] document_id=%s total=%d chunks, page_number distribution: %s",
+                document_id,
+                len(final_chunks),
+                {pn: sum(1 for _, p in final_chunks if p == pn) for pn in sorted({p for _, p in final_chunks})},
+            )
+
+            # 9-11. Insert chunks to DB, embed, upsert to Qdrant — processed in batches
+            # to avoid exhausting embedding quota and Qdrant payload limit in one shot.
+            _PIPELINE_BATCH = 50
+
+            for batch_start in range(0, len(final_chunks), _PIPELINE_BATCH):
+                batch = final_chunks[batch_start : batch_start + _PIPELINE_BATCH]
+                batch_end = batch_start + len(batch)
+                logger.info(
+                    "[pipeline] batch %d-%d / %d chunks",
+                    batch_start + 1, batch_end, len(final_chunks),
+                )
+
+                # 9. Insert DocumentChunk records for this batch
+                chunk_records: list[DocumentChunk] = []
+                for idx, (lc_chunk, page_num) in enumerate(batch, start=batch_start):
+                    chunk = DocumentChunk(
+                        document_id=document_id,
+                        chunk_index=idx,
+                        content=lc_chunk.page_content,
+                        page_number=page_num,
+                    )
+                    db.add(chunk)
+                    chunk_records.append(chunk)
+                await db.flush()  # populate chunk IDs
+
+                # 10. Embed this batch
+                texts = [c.content for c in chunk_records]
+                vectors = await embedding_svc.embed_texts(texts)
+
+                # 11. Upsert this batch to Qdrant
+                points: list[ChunkPoint] = []
+                for chunk, vector in zip(chunk_records, vectors):
+                    point_id = uuid.uuid4()
+                    points.append(
+                        ChunkPoint(
+                            id=point_id,
+                            vector=vector,
+                            payload={
+                                "document_id": str(document_id),
+                                "owner_id": str(document.owner_id),
+                                "chunk_id": str(chunk.id),
+                                "chunk_index": chunk.chunk_index,
+                                "page_number": chunk.page_number,
+                                "content": chunk.content,
+                            },
+                        )
+                    )
+                    chunk.qdrant_point_id = point_id
+                await vector_svc.upsert_chunks(points)
+
+            # 12. Update document metadata
+            # Excel: page_number = sheet index → count distinct sheets, not rows
+            if document.extension in _EXCEL_EXTENSIONS:
+                document.page_count = len({p.page_number for p in pages})
+            else:
+                document.page_count = len(pages)
+
+            # 13. Mark success
+            bg_task.status = "success"
+            bg_task.result = {"page_count": len(pages), "chunk_count": len(chunk_records)}
+            bg_task.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            return bg_task.result
+
+        except Exception as e:
+            try:
+                bg_task = await db.get(BackgroundTask, task_id)
+                if bg_task:
+                    bg_task.status = "failure"
+                    bg_task.error_message = repr(e)
+                    bg_task.completed_at = datetime.now(timezone.utc)
+                    await db.commit()
+            except Exception:
+                pass
+            raise
+
+
+async def extract_template_task(
+    ctx: dict,
+    task_id: uuid.UUID,
+    document_id: uuid.UUID,
+    user_id: uuid.UUID,
+    description: str | None = None,
+) -> dict:
+    """Background task: extract template from a document.
+
+    Creates a template copy with {placeholder} tokens replacing blank fields.
+    """
+    session_factory = ctx["session_factory"]
+    settings = get_settings()
+
+    async with session_factory() as db:
+        db: AsyncSession
+
+        bg_task = await db.get(BackgroundTask, task_id)
+        if bg_task:
+            bg_task.status = "running"
+            bg_task.started_at = datetime.now(timezone.utc)
+            await db.commit()
+
+        document = await db.get(Document, document_id)
+        if document is None:
+            msg = "Document not found"
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = msg
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return {"error": msg}
+        if document.extension.lower() != ".docx":
+            msg = (
+                f"Template extraction chỉ hỗ trợ file .docx. "
+                f"File này có định dạng '{document.extension}' — vui lòng upload file Word."
+            )
+            logger.warning(
+                "Template extraction rejected for document %s (extension=%s)",
+                document_id, document.extension,
+            )
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = msg
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return {"error": msg}
+
+        # Load chat LLM config from admin-configured AIModelConfig — no env fallback.
+        from src.services.ai_model_config_service import get_default_litellm_config
+
+        _llm_cfg = await get_default_litellm_config(db, "chat")
+        _llm_kwargs = _llm_cfg.to_kwargs()
+
+        # Build an llm_call function using litellm
+        async def llm_call(messages, response_format=None):
+            import litellm
+            kwargs = {"messages": messages, "stream": False, **_llm_kwargs}
+            if response_format:
+                kwargs["response_format"] = response_format
+            resp = await litellm.acompletion(**kwargs)
+            return resp.choices[0].message.content or ""
+
+        try:
+            result = await extract_template(
+                db=db,
+                settings=settings,
+                document_id=document_id,
+                user_id=user_id,
+                description=description,
+                llm_call=llm_call,
+            )
+
+            # extract_template returns {"error": "..."} for expected failures (no fields, etc.)
+            if result.get("error"):
+                raise ValueError(result["error"])
+
+            logger.info("Template extraction completed: %s", result.get("template_id"))
+
+            # Update source document metadata so polling via original ID works
+            document = await db.get(Document, document_id)
+            if document is not None:
+                from sqlalchemy.orm.attributes import flag_modified
+                meta = dict(document.source_metadata or {})
+                meta["extraction_status"] = "completed"
+                meta["template_id"] = result.get("template_id")
+                document.source_metadata = meta
+                flag_modified(document, "source_metadata")
+
+            if bg_task:
+                bg_task.status = "success"
+                bg_task.result = result
+                bg_task.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            return result
+        except Exception as e:
+            logger.exception("Template extraction failed for document %s", document_id)
+
+            # Mark source document as failed so frontend polling stops
+            document = await db.get(Document, document_id)
+            if document is not None:
+                from sqlalchemy.orm.attributes import flag_modified
+                meta = dict(document.source_metadata or {})
+                meta["extraction_status"] = "failed"
+                meta["extraction_error"] = str(e)
+                document.source_metadata = meta
+                flag_modified(document, "source_metadata")
+
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = str(e)
+                bg_task.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return {"error": str(e)}
+
+
+async def extract_template_draft_task(
+    ctx: dict,
+    task_id: uuid.UUID,
+    document_id: uuid.UUID,
+) -> dict:
+    """Background task: run LLM extraction and store DRAFT result.
+
+    Does NOT create a template Document. Result is stored on the
+    BackgroundTask.result so the frontend can poll, review, and edit
+    before calling commit_template.
+    """
+    session_factory = ctx["session_factory"]
+    settings = get_settings()
+
+    async with session_factory() as db:
+        db: AsyncSession
+
+        bg_task = await db.get(BackgroundTask, task_id)
+        if bg_task:
+            bg_task.status = "running"
+            bg_task.started_at = datetime.now(timezone.utc)
+            await db.commit()
+
+        document = await db.get(Document, document_id)
+        if document is None:
+            msg = "Document not found"
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = msg
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return {"error": msg}
+        if document.extension.lower() != ".docx":
+            msg = (
+                f"Template extraction chỉ hỗ trợ file .docx. "
+                f"File này có định dạng '{document.extension}' — vui lòng upload file Word."
+            )
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = msg
+                bg_task.completed_at = datetime.now(timezone.utc)
+                await db.commit()
+            return {"error": msg}
+
+        # LLM config — no env fallback, admin must configure via UI
+        from src.services.ai_model_config_service import get_default_litellm_config
+
+        _llm_cfg = await get_default_litellm_config(db, "chat")
+        _llm_kwargs = _llm_cfg.to_kwargs()
+
+        async def llm_call(messages, response_format=None):
+            import litellm
+            kwargs = {"messages": messages, "stream": False, **_llm_kwargs}
+            if response_format:
+                kwargs["response_format"] = response_format
+            resp = await litellm.acompletion(**kwargs)
+            return resp.choices[0].message.content or ""
+
+        try:
+            result = await extract_template_draft(
+                db=db,
+                document_id=document_id,
+                llm_call=llm_call,
+            )
+
+            if result.get("error"):
+                raise ValueError(result["error"])
+
+            logger.info(
+                "Draft extraction completed for document %s (%d fields)",
+                document_id, len(result.get("fields", [])),
+            )
+
+            # Mark source document extraction status — user still needs to commit
+            document = await db.get(Document, document_id)
+            if document is not None:
+                from sqlalchemy.orm.attributes import flag_modified
+                meta = dict(document.source_metadata or {})
+                meta["extraction_status"] = "draft_ready"
+                document.source_metadata = meta
+                flag_modified(document, "source_metadata")
+
+            if bg_task:
+                bg_task.status = "success"
+                bg_task.result = result
+                bg_task.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            return result
+        except Exception as e:
+            logger.exception("Draft extraction failed for document %s", document_id)
+
+            document = await db.get(Document, document_id)
+            if document is not None:
+                from sqlalchemy.orm.attributes import flag_modified
+                meta = dict(document.source_metadata or {})
+                meta["extraction_status"] = "failed"
+                meta["extraction_error"] = str(e)
+                document.source_metadata = meta
+                flag_modified(document, "source_metadata")
+
+            if bg_task:
+                bg_task.status = "failure"
+                bg_task.error_message = str(e)
+                bg_task.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return {"error": str(e)}

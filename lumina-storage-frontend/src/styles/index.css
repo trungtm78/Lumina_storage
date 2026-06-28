@@ -1,0 +1,308 @@
+@import "./fonts.css";
+@import "./tailwind.css";
+@import "./theme.css";
+
+/* Fix: Radix ScrollArea inserts an internal display:table wrapper that expands to
+   natural content width, causing the wizard sidebar to overflow horizontally.
+   Override display to block so it respects the viewport's 100% width instead. */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none; /* IE, Edge cũ */
+  scrollbar-width: none; /* Firefox */
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none; /* Chrome, Safari */
+  width: 0;
+  height: 0;
+}
+
+@theme {
+  --breakpoint-xs: 480px;
+}
+
+/* ── DOCX HTML Preview (mammoth output) ── */
+.docx-html-preview {
+  font-size: 14px;
+  line-height: 1.7;
+  color: #1a1a1a;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  overflow-x: hidden;
+}
+.docx-html-preview p {
+  margin: 0.4em 0;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.docx-html-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  table-layout: fixed;
+  margin: 0.8em 0;
+}
+.docx-html-preview td,
+.docx-html-preview th {
+  border: 1px solid #d1d5db;
+  padding: 6px 10px;
+  vertical-align: top;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.docx-html-preview strong {
+  font-weight: 600;
+}
+.docx-html-preview h1 {
+  font-size: 1.3em;
+  font-weight: 700;
+  margin: 0.6em 0;
+}
+.docx-html-preview h2 {
+  font-size: 1.1em;
+  font-weight: 600;
+  margin: 0.5em 0;
+}
+/* Lists: khôi phục marker (Tailwind preflight reset) — cho cả preview lẫn TipTap editor */
+/* .docx-html-preview ul {
+  list-style: disc;
+  padding-left: 1.5rem;
+  margin: 0.4em 0;
+} */
+.docx-html-preview li {
+  margin: 0.2em 0;
+}
+/* Word auto-numbering (1.1, a), Điều N…) reconstructed by the backend and
+   injected by CenterDocViewer — mammoth.js drops these so we render them.
+   Flex layout on the parent keeps the label and content on the same line
+   regardless of label length or Vietnamese wide characters. */
+.docx-html-preview .docx-auto-num {
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-right: 0.35em;
+}
+.docx-html-preview .docx-num-content {
+  flex: 1;
+  min-width: 0;
+}
+/* TipTap editor: vùng soạn thảo chiếm đủ chiều cao + con trỏ */
+.docx-html-preview.ProseMirror {
+  outline: none;
+  min-height: 560px;
+}
+.docx-html-preview.ProseMirror:focus {
+  outline: none;
+}
+
+/* ── AI đề xuất chỉnh sửa: diff inline trên nguyên tài liệu ── */
+.dg-diff-block {
+  position: relative;
+  border-radius: 3px;
+}
+.dg-diff-old {
+  text-decoration: line-through;
+  color: #b91c1c;
+  background: #fef2f2;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+.dg-diff-new {
+  color: #047857;
+  background: #ecfdf5;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+.dg-diff-ins {
+  border-left: 3px solid #34d399;
+  padding-left: 6px;
+}
+.dg-diff-actions {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 6px;
+  vertical-align: middle;
+  user-select: none;
+}
+.dg-diff-actions > span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.dg-diff-accept {
+  color: #047857;
+  background: #d1fae5;
+  border-color: #6ee7b7 !important;
+}
+.dg-diff-accept:hover {
+  background: #a7f3d0;
+}
+.dg-diff-reject {
+  color: #b91c1c;
+  background: #fee2e2;
+  border-color: #fca5a5 !important;
+}
+.dg-diff-reject:hover {
+  background: #fecaca;
+}
+/* Đã chọn áp dụng → chỉ hiện nội dung mới như bình thường */
+.dg-diff-block.dg-accepted .dg-diff-old {
+  display: none;
+}
+.dg-diff-block.dg-accepted .dg-diff-new {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.dg-diff-block.dg-accepted .dg-diff-accept {
+  background: #047857;
+  color: #fff;
+}
+/* Đã bỏ → giữ nguyên bản gốc */
+.dg-diff-block.dg-rejected .dg-diff-new {
+  display: none;
+}
+.dg-diff-block.dg-rejected .dg-diff-old {
+  text-decoration: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.dg-diff-block.dg-rejected.dg-diff-ins {
+  opacity: 0.4;
+  border-left-color: #d1d5db;
+}
+.dg-diff-block.dg-rejected .dg-diff-reject {
+  background: #b91c1c;
+  color: #fff;
+}
+
+/* ── Doc Review inline highlights — two-tier ────────────────────────────────
+   *-line : outer span — wraps the full clause/sentence, subtle background tint
+            shows WHICH clause is flagged without overwhelming the page
+   *-kw   : inner span — wraps only the problematic keyword, stronger highlight
+            shows WHAT exactly is the issue
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* PASS (green) */
+.highlight-pass-line {
+  background-color: rgb(209 250 229 / 0.18);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.highlight-pass-kw {
+  background-color: rgb(209 250 229 / 0.85);
+  border-bottom: 2px solid rgb(52 211 153);
+  font-weight: 500;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* WARNING (yellow) */
+.highlight-warning-line {
+  background-color: rgb(254 243 199 / 0.22);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.highlight-warning-kw {
+  background-color: rgb(254 243 199 / 0.9);
+  border-bottom: 2px solid rgb(251 191 36);
+  font-weight: 500;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* RISK (red) */
+.highlight-risk-line {
+  background-color: rgb(254 226 226 / 0.22);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.highlight-risk-kw {
+  background-color: rgb(254 226 226 / 0.9);
+  border-bottom: 2px solid rgb(248 113 113);
+  font-weight: 500;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* COMPARE (amber) */
+.highlight-compare-line {
+  background-color: rgb(254 249 195 / 0.25);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.highlight-compare-kw {
+  background-color: rgb(254 249 195 / 0.95);
+  border-bottom: 2px solid rgb(234 179 8);
+  font-weight: 500;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+/* REFERENCE (blue) */
+.highlight-reference-line {
+  background-color: rgb(219 234 254 / 0.22);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.highlight-reference-kw {
+  background-color: rgb(219 234 254 / 0.9);
+  border-bottom: 2px solid rgb(96 165 250);
+  font-weight: 500;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.applied-fix {
+  background-color: rgb(240 253 244);
+  outline: 1px solid rgb(110 231 183);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.applied-fix-label {
+  font-size: 10px;
+  color: rgb(4 120 87);
+}
+
+/* Highlight có ref_id — thêm visual cue để user biết click được sang sidebar */
+[data-ref-id] {
+  cursor: pointer;
+}
+[data-ref-id]:hover {
+  filter: brightness(0.94);
+  outline: 1.5px solid currentColor;
+  outline-offset: 1px;
+}
+.edit-del {
+  text-decoration: line-through;
+  color: rgb(185 28 28);
+  background-color: rgb(254 226 226 / 0.6);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.edit-ins {
+  color: rgb(5 150 105);
+  background-color: rgb(209 250 229 / 0.6);
+  border-radius: 2px;
+  padding: 0 1px;
+  font-style: normal;
+}
+
+@keyframes doc-review-slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}

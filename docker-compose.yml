@@ -1,0 +1,193 @@
+name: lumina-storage-dev
+
+# Lumina Storage local-dev stack — self-contained.
+# Starts infra (postgres + redis + qdrant + gotenberg) + storage backend
+# (app + worker + one-shot migrate). Frontend runs on host via `npm run dev`.
+#
+# Usage:
+#   cp .env.example .env       # edit SECRET_KEY (required)
+#   cd lumina-storage-frontend && cp .env.example .env.development.local
+#   docker compose up -d --build
+#   docker compose logs -f app
+#   docker compose down -v     # full cleanup (drops volumes)
+
+services:
+  # ── Infrastructure ───────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lumina-storage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lumina}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lumina123}
+      POSTGRES_DB: ${POSTGRES_DB:-lumina_driver_dev}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lumina}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: lumina-storage-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: lumina-storage-qdrant
+    restart: unless-stopped
+    # No healthcheck — qdrant image is intentionally minimal (no curl/wget),
+    # and its /healthz returns JSON not plain text. We rely on the backend's
+    # own retry on startup (VectorService.ensure_collection). If qdrant is
+    # slow to boot, bump QDRANT_START_PERIOD below or restart `app` later.
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: lumina-storage-gotenberg
+    restart: unless-stopped
+    command:
+      - gotenberg
+      - --libreoffice-auto-start
+      - --libreoffice-start-timeout=120s
+      - --api-timeout=180s
+    ports:
+      - "${GOTENBERG_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Lumina Storage Backend ───────────────────────────────────────────────
+
+  migrate:
+    build:
+      context: ./lumina-storage-backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-storage-migrate
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-lumina}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-lumina123}
+      DB_NAME: ${POSTGRES_DB:-lumina_driver_dev}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      GOTENBERG_URL: http://gotenberg:3000
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build:
+      context: ./lumina-storage-backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-storage-app
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-lumina}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-lumina123}
+      DB_NAME: ${POSTGRES_DB:-lumina_driver_dev}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      GOTENBERG_URL: http://gotenberg:3000
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:5174"]}
+    ports:
+      - "${STORAGE_PORT:-1690}:1688"
+    volumes:
+      - ./lumina-storage-backend/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # qdrant: no healthcheck (see qdrant service above); just wait for
+      # the container to be created. The backend's own startup retries
+      # until VectorService.ensure_collection() succeeds.
+      qdrant:
+        condition: service_started
+      gotenberg:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: ./lumina-storage-backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-storage-worker
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-lumina}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-lumina123}
+      DB_NAME: ${POSTGRES_DB:-lumina_driver_dev}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QDRANT_URL: http://qdrant:6333
+      GOTENBERG_URL: http://gotenberg:3000
+    command: ["arq", "src.worker.settings.WorkerSettings"]
+    # Worker chạy ARQ (không serve HTTP) → vô hiệu hoá healthcheck HTTP kế thừa
+    # từ image dùng chung; nếu không sẽ luôn báo "unhealthy" sai.
+    healthcheck:
+      disable: true
+    volumes:
+      - ./lumina-storage-backend/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      gotenberg:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Frontend (lumina-storage-frontend) runs OUTSIDE docker:
+  #   cd lumina-storage-frontend && npm install && npm run dev
+  # Vite defaults to port 5174 (strictPort in vite.config.ts).
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:

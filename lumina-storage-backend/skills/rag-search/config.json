@@ -1,0 +1,38 @@
+{
+  "app_id": "rag-search",
+  "name": "rag-search",
+  "version": "1.0.0",
+  "description": "Tìm kiếm nội dung tài liệu trong knowledge base. Dùng khi user hỏi/tìm thông tin từ các file đã upload.",
+  "description_short": "Tìm kiếm nội dung tài liệu trong knowledge base. Dùng khi user hỏi/tìm thông tin từ các file đã upload.",
+  "category": "Chat",
+  "company": {
+    "name": "Lumina Technology JSC",
+    "website": "https://lumina.io",
+    "support_email": "support@lumina.io"
+  },
+  "target": {
+    "systems": [
+      "all"
+    ],
+    "modules": [
+      "chat"
+    ],
+    "min_version": "2.0.0"
+  },
+  "dependencies": [],
+  "permissions": [
+    "read:documents"
+  ],
+  "auto_activate": false,
+  "is_active": false,
+  "triggers": {
+    "keywords": [
+      "tìm",
+      "search",
+      "tìm kiếm",
+      "tra cứu",
+      "có thông tin gì",
+      "nội dung"
+    ]
+  }
+}

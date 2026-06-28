@@ -1,0 +1,35 @@
+{
+  "app_id": "xlsx-form-fill",
+  "name": "xlsx-form-fill",
+  "version": "1.0.0",
+  "description": "Điền thông tin vào template Excel (.xlsx/.xls). Dùng khi user muốn fill/điền/cập nhật bảng tính, báo cáo, hoặc file Excel có ô trống.",
+  "description_short": "Điền thông tin vào template Excel (.xlsx/.xls). Dùng khi user muốn fill/điền/cập nhật bảng tính, báo cáo, hoặc file Excel có ô trống.",
+  "category": "Automation",
+  "company": {
+    "name": "Lumina Technology JSC",
+    "website": "https://lumina.io",
+    "support_email": "support@lumina.io"
+  },
+  "target": {
+    "systems": [
+      "core",
+      "storage"
+    ],
+    "modules": [
+      "chat"
+    ],
+    "min_version": "2.0.0"
+  },
+  "dependencies": [],
+  "permissions": [
+    "read:documents"
+  ],
+  "auto_activate": false,
+  "is_active": false,
+  "triggers": {
+    "extensions": [
+      ".xlsx",
+      ".xls"
+    ]
+  }
+}

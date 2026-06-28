@@ -1,0 +1,107 @@
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: lumina-driver-redis
+    restart: unless-stopped
+    # AOF persistence: jobs queued to redis survive a restart (everysec fsync = <1s data loss)
+    command: >
+      sh -c '[ -n "${REDIS_PASSWORD}" ]
+      && exec redis-server --requirepass "${REDIS_PASSWORD}" --appendonly yes --appendfsync everysec
+      || exec redis-server --appendonly yes --appendfsync everysec'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: lumina-driver-gotenberg
+    restart: unless-stopped
+    command:
+      - gotenberg
+      - --libreoffice-auto-start
+      - --libreoffice-start-timeout=120s
+      - --api-timeout=180s
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── Application ─────────────────────────────────────────────────────────────
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-driver-app
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REDIS_HOST: redis
+      GOTENBERG_URL: http://gotenberg:3000
+      LUMINA_SSO_SERVICE_URL: ${LUMINA_SSO_SERVICE_URL:-http://192.168.1.229:3100}
+    ports:
+      - "1690:1688"
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+      gotenberg:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-driver-migrate
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: lumina-driver-worker
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      REDIS_HOST: redis
+      GOTENBERG_URL: http://gotenberg:3000
+    command: ["arq", "src.worker.settings.WorkerSettings"]
+    volumes:
+      - ./uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, redis; redis.Redis(host=os.environ.get('REDIS_HOST','redis'), port=int(os.environ.get('REDIS_PORT','6379')), password=os.environ.get('REDIS_PASSWORD') or None).ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
+      gotenberg:
+        condition: service_healthy
+
+volumes:
+  redisdata:

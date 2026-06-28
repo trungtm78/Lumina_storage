@@ -1,0 +1,21 @@
+# Secrets — KHÔNG commit
+.env
+*.env.local
+lumina-storage-frontend/.env.development.local
+lumina-storage-frontend/.env*.local
+
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Build / runtime
+dist/
+build/
+lumina-storage-backend/uploads/
+*.log
+
+# IDE
+.vscode/
+.idea/
