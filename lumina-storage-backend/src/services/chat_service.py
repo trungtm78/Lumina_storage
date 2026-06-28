@@ -145,7 +145,8 @@ class ChatService:
     async def create_session(self, user_id: uuid.UUID, title: str | None = None) -> ChatSession:
         session = ChatSession(user_id=user_id, title=title)
         self.db.add(session)
-        await self.db.commit()
+        # Phase 3: commit ở boundary (get_db). flush+refresh để có id trả về.
+        await self.db.flush()
         await self.db.refresh(session)
         return session
 
@@ -270,13 +271,15 @@ class ChatService:
                 except Exception:
                     pass
 
-        await self.db.commit()
+        # Phase 3: commit ở boundary (get_db) — xóa session + docs là MỘT transaction.
+        await self.db.flush()
 
     async def update_session(self, session_id: uuid.UUID, user_id: uuid.UUID, title: str | None) -> ChatSession:
         session = await self.assert_owned(session_id, user_id)
         if title is not None:
             session.title = title
-            await self.db.commit()
+            # Phase 3: commit ở boundary (get_db).
+            await self.db.flush()
             await self.db.refresh(session)
         return session
 
@@ -424,6 +427,10 @@ class ChatService:
             )
             self.db.add(source)
 
+        # Phase 3 — COMMIT CỐ Ý (commit-before-background): ngay sau đây spawn
+        # _generate_title_background ở SESSION RIÊNG, đọc message/session vừa lưu →
+        # phải bền trước. Cũng đảm bảo message của stream được lưu độc lập với vòng
+        # đời streaming response. Đây là boundary cố ý, KHÔNG gỡ.
         await self.db.commit()
 
         # Reload sources with document info for SSE event
@@ -683,6 +690,8 @@ class ChatService:
 
         # Save ID before expire_all to avoid lazy-load in async context
         assistant_msg_id = assistant_msg.id
+        # Phase 3 — COMMIT CỐ Ý (commit-before-background): _generate_title_background
+        # spawn ngay sau, đọc ở session riêng → message phải bền trước. Boundary cố ý.
         await self.db.commit()
         # Evict stale ORM objects so selectinload below gets consistent UUID
         # types from asyncpg (expire_on_commit=False means they aren't auto-evicted)

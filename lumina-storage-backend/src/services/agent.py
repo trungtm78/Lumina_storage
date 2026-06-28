@@ -254,6 +254,8 @@ async def write_file(
             deps.db.add(new_doc)
             await deps.db.flush()
             await deps.db.refresh(new_doc)
+            # Phase 3 — COMMIT CỐ Ý: tool save_document phải bền NGAY (side-effect độc
+            # lập), không bị rollback nếu bước agent sau trong cùng stream lỗi. Boundary cố ý.
             await deps.db.commit()
             doc_id = new_doc.id
 
