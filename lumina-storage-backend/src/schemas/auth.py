@@ -4,11 +4,34 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, field_validator, model_validator
 
 
+def validate_password_strength(v: str) -> str:
+    """Chính sách mật khẩu dùng chung: ≥8 ký tự, có cả chữ lẫn số.
+
+    Tái dùng cho RegisterRequest (tạo user) và ChangePasswordRequest (đổi mật khẩu)
+    để chính sách nhất quán, không lệch giữa hai luồng.
+    """
+    if len(v) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    # Phải có CẢ chữ lẫn số. Dùng any() thay vì isalpha()/isdigit() vì các hàm đó
+    # chỉ bắt chuỗi toàn-chữ hoặc toàn-số — chuỗi như "!!!!!!!!" hay "        "
+    # (không chữ, không số) sẽ lọt nếu chỉ kiểm isalpha()/isdigit().
+    has_letter = any(c.isalpha() for c in v)
+    has_digit = any(c.isdigit() for c in v)
+    if not (has_letter and has_digit):
+        raise ValueError("Password must contain both letters and digits")
+    return v
+
+
 class RegisterRequest(BaseModel):
     username: str
     email: EmailStr
     password: str
     full_name: str = ""
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        return validate_password_strength(v)
 
 
 class LoginRequest(BaseModel):
@@ -36,11 +59,7 @@ class ChangePasswordRequest(BaseModel):
     @field_validator("new_password")
     @classmethod
     def validate_new_password(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("New password must be at least 8 characters")
-        if v.isalpha() or v.isdigit():
-            raise ValueError("New password must contain both letters and digits")
-        return v
+        return validate_password_strength(v)
 
 
 class UserResponse(BaseModel):
