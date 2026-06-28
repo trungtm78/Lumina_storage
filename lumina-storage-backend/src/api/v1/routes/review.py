@@ -21,7 +21,6 @@ from typing import Literal
 from urllib.parse import quote as _urlquote
 from pathlib import Path
 
-import litellm
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -1749,20 +1748,20 @@ def _safe_json_loads(raw: str) -> dict:
 
 
 async def _call_llm(prompt: str, db: AsyncSession) -> dict:
-    """Gọi LLM với system prompt review, trả về parsed JSON dict."""
-    from src.services.ai_model_config_service import get_default_litellm_config
+    """Gọi LLM với system prompt review, trả về parsed JSON dict.
 
-    # Phase 4 (C1): per-call params qua to_kwargs(overrides) — giữ deterministic
-    # (temperature=0, seed=42) THẮNG config, tránh collision duplicate-kwarg.
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs(
-        stream=False, temperature=0, seed=42,
-    )
-    response = await litellm.acompletion(
-        messages=[
+    Phase 4 T5: qua AIGateway (điểm vào duy nhất). complete() force stream=False;
+    overrides temperature=0/seed=42 giữ tính DETERMINISTIC của chấm điểm review (C1).
+    """
+    from src.ai import AIGateway
+
+    response = await AIGateway(db).complete(
+        [
             {"role": "system", "content": _SYSTEM_REVIEW_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        **_llm_kwargs,
+        temperature=0,
+        seed=42,
     )
     return _safe_json_loads(response.choices[0].message.content or "")
 
