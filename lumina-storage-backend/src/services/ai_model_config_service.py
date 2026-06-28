@@ -100,8 +100,8 @@ class AIModelConfigService:
             await self.repo.clear_default(data.purpose)
 
         config = await self.repo.create(data.model_dump())
-        await self.db.commit()
-        await self.db.refresh(config)
+        # Phase 3: KHÔNG commit ở service — boundary (get_db/uow) commit cuối request.
+        # repo.create đã flush+refresh nên config đã có id/default đầy đủ để serialize.
         return AIModelConfigResponse.model_validate(config)
 
     async def list_by_purpose(self, purpose: str) -> list[AIModelConfigResponse]:
@@ -127,8 +127,7 @@ class AIModelConfigService:
 
         update_data = {k: v for k, v in data.model_dump().items() if v is not None}
         updated = await self.repo.update(config_id, update_data)
-        await self.db.commit()
-        await self.db.refresh(updated)
+        # Phase 3: commit ở boundary; repo.update đã flush+refresh.
         return AIModelConfigResponse.model_validate(updated)
 
     async def delete(self, config_id: uuid.UUID) -> None:
@@ -138,7 +137,7 @@ class AIModelConfigService:
         if config.is_default:
             raise BadRequestError("Cannot delete the default model config")
         await self.repo.delete(config_id)
-        await self.db.commit()
+        # Phase 3: commit ở boundary (get_db/uow).
 
     async def set_default(self, config_id: uuid.UUID) -> AIModelConfigResponse:
         config = await self.repo.get_by_id(config_id)
@@ -147,8 +146,8 @@ class AIModelConfigService:
 
         await self.repo.clear_default(config.purpose)
         updated = await self.repo.update(config_id, {"is_default": True})
-        await self.db.commit()
-        await self.db.refresh(updated)
+        # Phase 3: clear_default + update là MỘT transaction; commit ở boundary →
+        # nếu lỗi giữa chừng, cả hai cùng rollback (không partial).
         return AIModelConfigResponse.model_validate(updated)
 
     async def get_for_chat_service(self, config_id: uuid.UUID) -> AIModelConfig | None:
