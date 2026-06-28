@@ -60,6 +60,3 @@ docker-compose.local.yml
 
 gcp-documentai-key.json
 .gstack/
-
-# Tests
-tests/
