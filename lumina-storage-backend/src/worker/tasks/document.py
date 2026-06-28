@@ -53,6 +53,7 @@ async def mark_ingest_status(session_factory, task_id: uuid.UUID, status: str, *
             bg.result = None
         for key, value in fields.items():
             setattr(bg, key, value)
+        # Phase 3 T5: commit checkpoint ở session riêng (độc lập business).
         await s.commit()
 
 
@@ -86,6 +87,7 @@ async def mark_extract_status(
                 meta["extraction_error"] = error_message
             doc.source_metadata = meta
             flag_modified(doc, "source_metadata")
+        # Phase 3 T5: commit checkpoint KÉP ở session riêng (độc lập business).
         await s.commit()
 
 
@@ -527,6 +529,7 @@ async def extract_template_task(
                 bg_task.result = result
                 bg_task.error_message = None  # dọn stale error nếu là retry
                 bg_task.completed_at = datetime.now(timezone.utc)
+            # Phase 3 T5: success commit trên business session (atomic với doc metadata completed).
             await db.commit()
 
             return result
@@ -627,6 +630,7 @@ async def extract_template_draft_task(
                 bg_task.result = result
                 bg_task.error_message = None  # dọn stale error nếu là retry
                 bg_task.completed_at = datetime.now(timezone.utc)
+            # Phase 3 T5: success commit trên business session (atomic với doc metadata completed).
             await db.commit()
 
             return result

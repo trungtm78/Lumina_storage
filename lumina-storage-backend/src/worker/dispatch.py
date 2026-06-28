@@ -67,6 +67,7 @@ async def dispatch_task(
 
     if job is not None:
         record.job_id = job.job_id
+        # Phase 3 T4: commit lần 2 chỉ để lưu job_id sau khi enqueue thành công.
         await db.commit()
         await db.refresh(record)
     return record

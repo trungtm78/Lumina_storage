@@ -81,6 +81,7 @@ async def _generate_title_background(
             response = await title_llm.ainvoke([HumanMessage(content=prompt)])
             title = response.content.strip().strip("\"'")
             session.title = title[:100] if title else user_msg[:50]
+            # Phase 3: background title task chạy ở SESSION RIÊNG → commit CỐ Ý.
             await db.commit()
     except Exception:
         logger.debug("Background title generation failed", exc_info=True)
