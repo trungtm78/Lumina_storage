@@ -5,6 +5,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Te
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.core.encryption import EncryptedString
 from src.models.base import Base, TimestampMixin
 
 
@@ -15,7 +16,7 @@ class AIModelConfig(TimestampMixin, Base):
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model_name: Mapped[str] = mapped_column(String(200), nullable=False)
     purpose: Mapped[str] = mapped_column(String(20), nullable=False)
-    api_key: Mapped[str | None] = mapped_column(Text)
+    api_key: Mapped[str | None] = mapped_column(EncryptedString)
     base_url: Mapped[str | None] = mapped_column(String(512))
     extra_config: Mapped[dict | None] = mapped_column(JSONB)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")

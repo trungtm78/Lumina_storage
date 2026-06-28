@@ -11,6 +11,8 @@ import base64
 import hashlib
 
 from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import Text
+from sqlalchemy.types import TypeDecorator
 
 from src.core.config import get_settings
 
@@ -67,6 +69,21 @@ def decrypt_value(value: str) -> str:
         except InvalidToken:
             continue
     return value  # corrupted hoặc không khớp khóa nào — graceful
+
+
+class EncryptedString(TypeDecorator):
+    """Cột tự mã hóa: ghi → encrypt_value (DB lưu 'enc:...'), đọc → decrypt_value.
+
+    Mã hóa atomic ở tầng ORM — mọi read/write qua cột này tự động mã hóa/giải mã,
+    không sót call site. DB không bao giờ lưu plaintext."""
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return encrypt_value(value) if value is not None else value
+
+    def process_result_value(self, value, dialect):
+        return decrypt_value(value) if value is not None else value
 
 
 def is_encrypted(value: str) -> bool:
