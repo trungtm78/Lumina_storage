@@ -40,7 +40,9 @@ _skill_service: SkillService | None = None
 
 
 def get_skill_service() -> SkillService:
-    """Get the singleton SkillService instance."""
+    """LEGACY getter (startup-only fallback). Route mới nên dùng
+    src.api.providers.get_skill_service (đọc app.state). Cùng instance được gán
+    ở lifespan nên không split-brain; getter này sẽ bỏ dần khi route migrate."""
     if _skill_service is None:
         raise RuntimeError("SkillService not initialized. App not started?")
     return _skill_service
@@ -54,8 +56,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
     await VectorService(settings).ensure_collection()
 
-    # Initialize singleton services
+    # Initialize singleton services (cũng đặt lên app.state cho DI providers)
     _skill_service = SkillService(settings)
+    app.state.skill_service = _skill_service
 
     # Enable LiteLLM → Langfuse tracing for all litellm.acompletion calls
     # (covers generator endpoints; chat/agent flows use LangChain callbacks separately)
