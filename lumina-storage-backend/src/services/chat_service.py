@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from src.core.config import Settings
 from src.core.exceptions import ForbiddenError, NotFoundError
+from src.ai.tracing import fire_and_forget_flush
 from src.core.langfuse import get_langfuse_handler
 from src.models.chat import ChatMessage, ChatMessageSource, ChatSession
 from src.models.user import User
@@ -456,9 +457,8 @@ class ChatService:
             for s in sources
         ]
 
-        # 10. Flush Langfuse
-        if langfuse_handler:
-            langfuse_handler.flush()
+        # 10. Flush Langfuse — Phase 4 T4: fire-and-forget (KHÔNG block response).
+        fire_and_forget_flush(langfuse_handler)
 
         # 11. Auto-generate title if session has none — fire-and-forget so stream closes immediately
         session = await self.db.get(ChatSession, session_id)
@@ -731,8 +731,8 @@ class ChatService:
             }
 
         # 13. Flush Langfuse
-        if langfuse_handler:
-            langfuse_handler.flush()
+        # Phase 4 T4: fire-and-forget flush (KHÔNG block response).
+        fire_and_forget_flush(langfuse_handler)
 
         # 14. Auto-generate title — fire-and-forget so stream closes immediately
         session = await self.db.get(ChatSession, session_id)

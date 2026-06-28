@@ -294,7 +294,8 @@ class LangfuseHTTPHandler(BaseCallbackHandler):
         })
 
     def flush(self) -> None:
-        """Send all buffered events to Langfuse ingestion API."""
+        """Send all buffered events to Langfuse ingestion API (ĐỒNG BỘ — chỉ dùng ở sync
+        context / fallback; HTTP path nên dùng aflush qua fire_and_forget_flush)."""
         if not self._events:
             return
         payload = {"batch": self._events}
@@ -311,6 +312,27 @@ class LangfuseHTTPHandler(BaseCallbackHandler):
             logger.warning("Langfuse ingestion error", exc_info=True)
         finally:
             self._events.clear()
+
+    async def aflush(self) -> None:
+        """Phase 4 T4 (C5): flush BẤT ĐỒNG BỘ qua httpx.AsyncClient — KHÔNG block event loop.
+        Capture + clear events TRƯỚC khi gửi (tránh double-send nếu gọi lại). Best-effort."""
+        if not self._events:
+            return
+        events = self._events
+        self._events = []  # clear ngay để lần gọi sau không gửi lại
+        try:
+            # timeout 10s (không 30s): trace best-effort, không giữ task lâu dưới tải cao
+            # (/codex T4 P2). aflush gọi 1 lần cuối luồng nên không lo late-event drain.
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self.host}/api/public/ingestion",
+                    json={"batch": events},
+                    auth=(self.public_key, self.secret_key),
+                )
+                if resp.status_code >= 400:
+                    logger.warning("Langfuse ingestion failed: %s %s", resp.status_code, resp.text[:500])
+        except Exception:
+            logger.warning("Langfuse ingestion error", exc_info=True)
 
 
 def get_langfuse_handler(
