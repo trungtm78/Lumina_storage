@@ -6,6 +6,7 @@ from sqlalchemy import delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
+from src.core.uow import uow_context
 from src.models.document import Document, DocumentChunk, DocumentContent
 from src.models.processing import BackgroundTask
 from src.repositories.document import StorageConfigRepository
@@ -16,6 +17,76 @@ from src.services.text_extraction_service import TextExtractionService
 from src.services.vector_service import ChunkPoint, VectorService
 
 logger = logging.getLogger(__name__)
+
+
+class _IngestFailed(Exception):
+    """Lỗi nghiệp vụ TERMINAL (vd document not found) — mark failure nhưng KHÔNG raise lại
+    (tránh arq retry vô ích). Khác lỗi hệ thống (extraction/DB) vốn raise để arq retry."""
+
+
+class _IngestSkip(Exception):
+    """Kết thúc THÀNH CÔNG sớm (vd document không có page) — mark success(skipped)."""
+
+    def __init__(self, result: dict) -> None:
+        super().__init__("ingest skipped")
+        self.result = result
+
+
+async def mark_ingest_status(session_factory, task_id: uuid.UUID, status: str, **fields) -> None:
+    """Phase 3 T5 — checkpoint status ở SESSION RIÊNG (độc lập transaction business).
+
+    Mở session ngắn, cập nhật BackgroundTask.status + fields (started_at/completed_at/
+    result/error_message) rồi commit. PHẢI tách khỏi session business để: status='failure'
+    SỐNG qua business rollback, và status='success' chỉ ghi SAU khi business commit. No-op
+    nếu task không tồn tại.
+    """
+    async with session_factory() as s:
+        bg = await s.get(BackgroundTask, task_id)
+        if bg is None:
+            return
+        bg.status = status
+        # Phase 3 T5: dọn field đối lập để ARQ retry không để lại trạng thái mâu thuẫn
+        # (vd success kèm error_message cũ). fields truyền vào sẽ ghi đè bên dưới.
+        if status in ("running", "success"):
+            bg.error_message = None
+        if status != "success":
+            bg.result = None
+        for key, value in fields.items():
+            setattr(bg, key, value)
+        await s.commit()
+
+
+async def mark_extract_status(
+    session_factory,
+    task_id: uuid.UUID,
+    document_id: uuid.UUID,
+    status: str,
+    doc_extraction_status: str,
+    *,
+    error_message: str | None = None,
+) -> None:
+    """Phase 3 T5 — checkpoint KÉP ở SESSION RIÊNG cho extract_template*: cập nhật cả
+    BackgroundTask.status LẪN source document.source_metadata['extraction_status'] (FE poll
+    cái sau để dừng spinner). Phải sống qua business rollback (vd extract lỗi giữa chừng).
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    async with session_factory() as s:
+        bg = await s.get(BackgroundTask, task_id)
+        if bg is not None:
+            bg.status = status
+            bg.completed_at = datetime.now(timezone.utc)
+            if error_message is not None:
+                bg.error_message = error_message
+        doc = await s.get(Document, document_id)
+        if doc is not None:
+            meta = dict(doc.source_metadata or {})
+            meta["extraction_status"] = doc_extraction_status
+            if error_message is not None:
+                meta["extraction_error"] = error_message
+            doc.source_metadata = meta
+            flag_modified(doc, "source_metadata")
+        await s.commit()
 
 
 async def cleanup_deleted_document_task(
@@ -59,28 +130,28 @@ async def cleanup_deleted_document_task(
 
 
 async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.UUID) -> dict:
-    session_factory = ctx["session_factory"]
+    """Phase 3 T5: checkpoint status (running/success/failure) ở SESSION RIÊNG qua
+    mark_ingest_status; business DB (DocumentContent + DocumentChunk + document fields)
+    trong uow_context (MỘT transaction) — lỗi giữa chừng → rollback DB NHƯNG status='failure'
+    vẫn ghi; status='success' chỉ ghi SAU khi business commit.
 
-    async with session_factory() as db:
-        db: AsyncSession
-        try:
-            # 1. Fetch BackgroundTask + Document
-            bg_task = await db.get(BackgroundTask, task_id)
-            if bg_task is None:
-                return {"error": "BackgroundTask not found"}
+    LƯU Ý: Qdrant (vector_svc) là side-effect NGOÀI transaction DB — uow_context KHÔNG
+    rollback được vector. Pipeline tự đồng bộ lại khi retry (đầu pipeline đã xóa chunk+vector
+    cũ rồi upsert lại → idempotent). Blue/green extraction triệt để thuộc Phase 5."""
+    session_factory = ctx["session_factory"]
+    # Checkpoint running (session riêng, độc lập business).
+    await mark_ingest_status(
+        session_factory, task_id, "running", started_at=datetime.now(timezone.utc)
+    )
+    result: dict
+    try:
+        # Business boundary: uow_context tạo session riêng + commit khi thoát sạch / rollback khi lỗi.
+        async with uow_context(session_factory) as uow:
+            db = uow.session
 
             document = await db.get(Document, document_id)
             if document is None:
-                bg_task.status = "failure"
-                bg_task.error_message = "Document not found"
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-                return {"error": "Document not found"}
-
-            # 2. Mark running
-            bg_task.status = "running"
-            bg_task.started_at = datetime.now(timezone.utc)
-            await db.commit()
+                raise _IngestFailed("Document not found")
 
             settings = get_settings()
 
@@ -139,12 +210,9 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                     )
 
             if not pages:
-                document.page_count = 0
-                bg_task.status = "success"
-                bg_task.result = {"page_count": 0, "chunk_count": 0, "skipped": True}
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
-                return bg_task.result
+                # page_count=0 ghi ở nhánh except _IngestSkip (session riêng) vì raise dưới
+                # đây sẽ rollback business — không set trên session business (sẽ mất).
+                raise _IngestSkip({"page_count": 0, "chunk_count": 0, "skipped": True})
 
             # 5. Upsert DocumentContent (raw_text = joined markdown)
             full_markdown = "\n\n".join(p.text for p in pages)
@@ -327,25 +395,43 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             else:
                 document.page_count = len(pages)
 
-            # 13. Mark success
-            bg_task.status = "success"
-            bg_task.result = {"page_count": len(pages), "chunk_count": len(chunk_records)}
-            bg_task.completed_at = datetime.now(timezone.utc)
-            await db.commit()
+            # 13. Business xong — set result (status='success' ghi SAU khi uow commit).
+            result = {"page_count": len(pages), "chunk_count": len(final_chunks)}
+        # uow_context commit business ở đây (thoát async with không lỗi).
+    except _IngestSkip as skip:
+        # Document không có page → success(skipped). Business đã rollback, nên persist
+        # page_count=0 ở SESSION RIÊNG (re-ingest từ N page → 0 page phải reset đúng).
+        async with session_factory() as s:
+            doc = await s.get(Document, document_id)
+            if doc is not None:
+                doc.page_count = 0
+            await s.commit()
+        await mark_ingest_status(
+            session_factory, task_id, "success",
+            result=skip.result, completed_at=datetime.now(timezone.utc),
+        )
+        return skip.result
+    except _IngestFailed as e:
+        # Lỗi nghiệp vụ terminal (document not found) → failure, KHÔNG raise (no arq retry).
+        await mark_ingest_status(
+            session_factory, task_id, "failure",
+            error_message=str(e), completed_at=datetime.now(timezone.utc),
+        )
+        return {"error": str(e)}
+    except Exception as e:
+        # Lỗi hệ thống → business ĐÃ rollback (uow_context); ghi failure ở SESSION RIÊNG rồi raise.
+        await mark_ingest_status(
+            session_factory, task_id, "failure",
+            error_message=repr(e), completed_at=datetime.now(timezone.utc),
+        )
+        raise
 
-            return bg_task.result
-
-        except Exception as e:
-            try:
-                bg_task = await db.get(BackgroundTask, task_id)
-                if bg_task:
-                    bg_task.status = "failure"
-                    bg_task.error_message = repr(e)
-                    bg_task.completed_at = datetime.now(timezone.utc)
-                    await db.commit()
-            except Exception:
-                pass
-            raise
+    # status='success' chỉ ghi SAU khi business commit (thoát async with không lỗi).
+    await mark_ingest_status(
+        session_factory, task_id, "success",
+        result=result, completed_at=datetime.now(timezone.utc),
+    )
+    return result
 
 
 async def extract_template_task(
@@ -369,16 +455,16 @@ async def extract_template_task(
         if bg_task:
             bg_task.status = "running"
             bg_task.started_at = datetime.now(timezone.utc)
+            bg_task.error_message = None  # dọn stale error từ lần retry trước
             await db.commit()
 
         document = await db.get(Document, document_id)
         if document is None:
             msg = "Document not found"
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = msg
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
+            # Phase 3 T5: ghi failure KÉP (bg + doc metadata) — FE poll extraction_status.
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=msg,
+            )
             return {"error": msg}
         if document.extension.lower() != ".docx":
             msg = (
@@ -389,11 +475,10 @@ async def extract_template_task(
                 "Template extraction rejected for document %s (extension=%s)",
                 document_id, document.extension,
             )
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = msg
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
+            # Phase 3 T5: set doc metadata 'failed' để FE polling dừng (không kẹt 'pending').
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=msg,
+            )
             return {"error": msg}
 
         # Load chat LLM config from admin-configured AIModelConfig — no env fallback.
@@ -440,28 +525,20 @@ async def extract_template_task(
             if bg_task:
                 bg_task.status = "success"
                 bg_task.result = result
+                bg_task.error_message = None  # dọn stale error nếu là retry
                 bg_task.completed_at = datetime.now(timezone.utc)
             await db.commit()
 
             return result
         except Exception as e:
             logger.exception("Template extraction failed for document %s", document_id)
-
-            # Mark source document as failed so frontend polling stops
-            document = await db.get(Document, document_id)
-            if document is not None:
-                from sqlalchemy.orm.attributes import flag_modified
-                meta = dict(document.source_metadata or {})
-                meta["extraction_status"] = "failed"
-                meta["extraction_error"] = str(e)
-                document.source_metadata = meta
-                flag_modified(document, "source_metadata")
-
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = str(e)
-                bg_task.completed_at = datetime.now(timezone.utc)
-            await db.commit()
+            # Phase 3 T5: rollback business (template doc dở) RỒI ghi failed ở SESSION RIÊNG
+            # (sống qua rollback + qua trường hợp session business bị poison) — FE poll
+            # source_metadata.extraction_status='failed' để dừng spinner.
+            await db.rollback()
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=str(e),
+            )
             return {"error": str(e)}
 
 
@@ -486,27 +563,25 @@ async def extract_template_draft_task(
         if bg_task:
             bg_task.status = "running"
             bg_task.started_at = datetime.now(timezone.utc)
+            bg_task.error_message = None  # dọn stale error từ lần retry trước
             await db.commit()
 
         document = await db.get(Document, document_id)
         if document is None:
             msg = "Document not found"
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = msg
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=msg,
+            )
             return {"error": msg}
         if document.extension.lower() != ".docx":
             msg = (
                 f"Template extraction chỉ hỗ trợ file .docx. "
                 f"File này có định dạng '{document.extension}' — vui lòng upload file Word."
             )
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = msg
-                bg_task.completed_at = datetime.now(timezone.utc)
-                await db.commit()
+            # Phase 3 T5: set doc metadata 'failed' để FE polling dừng (không kẹt 'pending').
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=msg,
+            )
             return {"error": msg}
 
         # LLM config — no env fallback, admin must configure via UI
@@ -550,25 +625,17 @@ async def extract_template_draft_task(
             if bg_task:
                 bg_task.status = "success"
                 bg_task.result = result
+                bg_task.error_message = None  # dọn stale error nếu là retry
                 bg_task.completed_at = datetime.now(timezone.utc)
             await db.commit()
 
             return result
         except Exception as e:
             logger.exception("Draft extraction failed for document %s", document_id)
-
-            document = await db.get(Document, document_id)
-            if document is not None:
-                from sqlalchemy.orm.attributes import flag_modified
-                meta = dict(document.source_metadata or {})
-                meta["extraction_status"] = "failed"
-                meta["extraction_error"] = str(e)
-                document.source_metadata = meta
-                flag_modified(document, "source_metadata")
-
-            if bg_task:
-                bg_task.status = "failure"
-                bg_task.error_message = str(e)
-                bg_task.completed_at = datetime.now(timezone.utc)
-            await db.commit()
+            # Phase 3 T5: rollback business RỒI ghi failed ở SESSION RIÊNG (sống qua rollback/
+            # poison) — FE poll source_metadata.extraction_status='failed' để dừng spinner.
+            await db.rollback()
+            await mark_extract_status(
+                session_factory, task_id, document_id, "failure", "failed", error_message=str(e),
+            )
             return {"error": str(e)}

@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import get_settings
+from src.core.uow import uow_context
 from src.models.document import Document
 from src.services.storage import get_storage_backend
 from src.repositories.document import StorageConfigRepository
@@ -12,8 +13,9 @@ from src.services.thumbnail import generate_thumbnail, save_thumbnail
 async def generate_thumbnail_task(ctx: dict, document_id: uuid.UUID) -> dict:
     session_factory = ctx["session_factory"]
 
-    async with session_factory() as db:
-        db: AsyncSession
+    # Phase 3 T5: business boundary = uow_context (commit khi thoát sạch / rollback khi lỗi).
+    async with uow_context(session_factory) as uow:
+        db: AsyncSession = uow.session
 
         document = await db.get(Document, document_id)
         if not document:
@@ -44,6 +46,6 @@ async def generate_thumbnail_task(ctx: dict, document_id: uuid.UUID) -> dict:
         thumbnail_path = await save_thumbnail(thumbnail_bytes, backend)
 
         document.image_thumbnail = thumbnail_path
-        await db.commit()
+        # commit ở uow_context boundary khi thoát async with.
 
         return {"thumbnail_path": thumbnail_path}

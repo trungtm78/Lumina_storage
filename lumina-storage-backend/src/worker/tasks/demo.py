@@ -2,55 +2,32 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from src.models.processing import BackgroundTask
+from src.worker.tasks.document import mark_ingest_status
 
 
 async def ping_task(ctx: dict, task_id: uuid.UUID) -> dict:
+    """Demo task: vòng đời status. Phase 3 T5: checkpoint qua mark_ingest_status (session riêng)."""
     session_factory = ctx["session_factory"]
-    async with session_factory() as db:
-        task = await db.get(BackgroundTask, task_id)
-        if task is None:
-            return {"error": "task not found"}
+    await mark_ingest_status(session_factory, task_id, "running", started_at=datetime.now(timezone.utc))
 
-        task.status = "running"
-        task.started_at = datetime.now(timezone.utc)
-        await db.commit()
+    result = {"message": "pong", "task_id": str(task_id)}
 
-        # Actual work
-        result = {"message": "pong", "task_id": str(task_id)}
-
-        task.status = "success"
-        task.completed_at = datetime.now(timezone.utc)
-        task.result = result
-        await db.commit()
-
+    await mark_ingest_status(
+        session_factory, task_id, "success",
+        completed_at=datetime.now(timezone.utc), result=result,
+    )
     return result
 
 
 async def long_running_task(ctx: dict, task_id: uuid.UUID, seconds: int = 5) -> dict:
     session_factory = ctx["session_factory"]
-    async with session_factory() as db:
-        task = await db.get(BackgroundTask, task_id)
-        if task is None:
-            return {"error": "task not found"}
-
-        task.status = "running"
-        task.started_at = datetime.now(timezone.utc)
-        await db.commit()
+    await mark_ingest_status(session_factory, task_id, "running", started_at=datetime.now(timezone.utc))
 
     await asyncio.sleep(seconds)
 
-    async with session_factory() as db:
-        task = await db.get(BackgroundTask, task_id)
-        if task is None:
-            return {"error": "task not found"}
-
-        result = {"message": f"slept for {seconds}s", "task_id": str(task_id)}
-        task.status = "success"
-        task.completed_at = datetime.now(timezone.utc)
-        task.result = result
-        await db.commit()
-
+    result = {"message": f"slept for {seconds}s", "task_id": str(task_id)}
+    await mark_ingest_status(
+        session_factory, task_id, "success",
+        completed_at=datetime.now(timezone.utc), result=result,
+    )
     return result

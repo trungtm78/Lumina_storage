@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from src.core.database import AsyncSessionLocal
+from src.core.uow import uow_context
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,9 @@ async def cleanup_agent_state_task(ctx: dict) -> int:
     """Strip skill_state from old chat messages. Returns rows updated."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=AGENT_STATE_TTL_DAYS)
 
-    async with AsyncSessionLocal() as db:
+    # Phase 3 T5: business boundary = uow_context với session_factory của ctx (testable).
+    async with uow_context(ctx["session_factory"]) as uow:
+        db = uow.session
         # We mutate via SQL because going through the ORM would load each JSONB
         # blob into Python — defeating the point of cleaning them up.
         result = await db.execute(
@@ -41,7 +43,6 @@ async def cleanup_agent_state_task(ctx: dict) -> int:
             ),
             {"cutoff": cutoff},
         )
-        await db.commit()
         rows = result.rowcount or 0
         logger.info("[agent_state_cleanup] stripped skill_state from %d messages older than %d days", rows, AGENT_STATE_TTL_DAYS)
         return rows

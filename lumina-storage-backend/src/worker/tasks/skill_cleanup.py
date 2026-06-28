@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, text
 
 from src.core.config import get_settings
-from src.core.database import AsyncSessionLocal
+from src.core.uow import uow_context
 from src.services.storage import get_storage_backend
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,9 @@ async def cleanup_skill_temp_task(ctx: dict) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     deleted = 0
 
-    async with AsyncSessionLocal() as db:
+    # Phase 3 T5: business boundary = uow_context với session_factory của ctx (testable).
+    async with uow_context(ctx["session_factory"]) as uow:
+        db = uow.session
         # Find old temp files
         result = await db.execute(
             text(
@@ -61,7 +63,7 @@ async def cleanup_skill_temp_task(ctx: dict) -> int:
             except Exception as exc:
                 logger.warning(f"[skill_cleanup] Failed to delete {doc_id}: {exc}")
 
-        await db.commit()
+        # commit ở uow_context boundary khi thoát async with.
         logger.info(f"[skill_cleanup] Deleted {deleted}/{len(rows)} temp files")
 
     return deleted
