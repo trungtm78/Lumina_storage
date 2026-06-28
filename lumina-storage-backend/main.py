@@ -75,6 +75,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 def create_app() -> FastAPI:
+    from src.core.logging import configure_logging
+    configure_logging()
+
     app = FastAPI(title="Lumina Driver Backend", version="1.0.0", lifespan=lifespan)
 
     settings = get_settings()
