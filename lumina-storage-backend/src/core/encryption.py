@@ -17,13 +17,30 @@ from src.core.config import get_settings
 _ENCRYPTED_PREFIX = "enc:"
 
 
-def _get_fernet() -> Fernet:
-    """Derive Fernet key from app SECRET_KEY (must be 32 url-safe bytes)."""
+def _fernet_for(key_material: str) -> Fernet:
+    """Tạo Fernet từ một chuỗi khóa (SHA-256 → 32 byte url-safe)."""
+    digest = hashlib.sha256(key_material.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _primary_key() -> str:
+    """Khóa dùng để MÃ HÓA: ENCRYPTION_KEY, fallback SECRET_KEY nếu trống."""
     settings = get_settings()
-    raw_key = settings.secret_key.encode("utf-8")
-    digest = hashlib.sha256(raw_key).digest()
-    key = base64.urlsafe_b64encode(digest)
-    return Fernet(key)
+    return settings.encryption_key or settings.secret_key
+
+
+def _decrypt_keys() -> list[str]:
+    """Thứ tự khóa thử khi GIẢI MÃ: ENCRYPTION_KEY trước, rồi SECRET_KEY legacy.
+
+    Cho phép migration mượt — data mã hóa bằng SECRET_KEY cũ vẫn đọc được sau
+    khi thêm ENCRYPTION_KEY mới. Dedupe để không thử trùng.
+    """
+    settings = get_settings()
+    keys: list[str] = []
+    for k in (settings.encryption_key, settings.secret_key):
+        if k and k not in keys:
+            keys.append(k)
+    return keys
 
 
 def encrypt_value(plaintext: str) -> str:
@@ -32,21 +49,24 @@ def encrypt_value(plaintext: str) -> str:
         return plaintext
     if plaintext.startswith(_ENCRYPTED_PREFIX):
         return plaintext  # already encrypted
-    f = _get_fernet()
-    token = f.encrypt(plaintext.encode("utf-8"))
+    token = _fernet_for(_primary_key()).encrypt(plaintext.encode("utf-8"))
     return _ENCRYPTED_PREFIX + token.decode("utf-8")
 
 
 def decrypt_value(value: str) -> str:
-    """Decrypt 'enc:...' string. Returns original plaintext. If not encrypted, returns as-is."""
+    """Decrypt 'enc:...'. Thử ENCRYPTION_KEY rồi SECRET_KEY legacy (migration).
+
+    Không mã hóa → trả as-is. Mọi khóa thất bại → trả as-is (graceful degradation).
+    """
     if not value or not value.startswith(_ENCRYPTED_PREFIX):
         return value
-    f = _get_fernet()
     token = value[len(_ENCRYPTED_PREFIX):].encode("utf-8")
-    try:
-        return f.decrypt(token).decode("utf-8")
-    except InvalidToken:
-        return value  # corrupted or wrong key — return as-is for graceful degradation
+    for key in _decrypt_keys():
+        try:
+            return _fernet_for(key).decrypt(token).decode("utf-8")
+        except InvalidToken:
+            continue
+    return value  # corrupted hoặc không khớp khóa nào — graceful
 
 
 def is_encrypted(value: str) -> bool:

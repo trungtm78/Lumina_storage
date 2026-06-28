@@ -9,6 +9,9 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     secret_key: str = "changeme"
+    # Khóa Fernet riêng cho mã hóa data (credential). Trống → fallback secret_key
+    # (kèm cảnh báo). Tách riêng để lộ JWT key không kéo theo lộ khóa mã hóa data.
+    encryption_key: str = ""
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:5174" ]
     gotenberg_url: str = "http://localhost:3000"
 
@@ -100,6 +103,13 @@ def validate_secrets(settings: Settings) -> None:
     Một SECRET_KEY placeholder/ngắn/low-entropy cho phép forge JWT (chiếm admin).
     """
     import logging
+
+    # Cảnh báo MỘT LẦN ở startup (không spam hot path encrypt/decrypt).
+    if not settings.encryption_key:
+        logging.getLogger(__name__).warning(
+            "[config] ENCRYPTION_KEY trống — credential sẽ mã hóa bằng SECRET_KEY. "
+            "Đặt ENCRYPTION_KEY riêng cho production."
+        )
 
     if not _is_weak_secret(settings.secret_key):
         return
