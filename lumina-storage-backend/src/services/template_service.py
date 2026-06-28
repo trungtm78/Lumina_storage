@@ -808,7 +808,7 @@ async def commit_template(
     db.add(template_doc)
     await db.flush()
     await db.refresh(template_doc)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db) — route gọi commit_template trong request scope.
 
     return {
         "template_id": str(template_doc.id),

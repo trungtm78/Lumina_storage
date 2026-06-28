@@ -322,6 +322,10 @@ async def generate_document(
         owner_id=current_user.id,
         db=db,
     )
+    # Phase 3 — COMMIT CỐ Ý: document phải BỀN trước khối preview best-effort bên dưới.
+    # Preview add/flush pdf_doc trong `try/except: pass`; nếu flush lỗi DB → transaction
+    # bị poison nhưng exception bị nuốt → boundary cuối request sẽ rollback và MẤT luôn
+    # document user vừa tạo. Commit ở đây tách document khỏi side-effect preview. KHÔNG gỡ.
     await db.commit()
 
     document_id = rendered_doc.id
@@ -363,6 +367,9 @@ async def generate_document(
                     db.add(pdf_doc)
                     await db.flush()
                     await db.refresh(pdf_doc)
+                    # Phase 3 — COMMIT CỐ Ý: persist preview NGAY (best-effort, độc lập
+                    # document đã commit ở trên). Nếu bước nào của preview lỗi → except
+                    # nuốt, document vẫn bền. KHÔNG gỡ.
                     await db.commit()
                     preview_pdf_id = pdf_doc.id
         except Exception:
@@ -873,7 +880,7 @@ async def draft_to_template(
     db.add(template_doc)
     await db.flush()
     await db.refresh(template_doc)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
 
     return DraftToTemplateResponse(
         template_id=str(template_doc.id),
@@ -1601,7 +1608,8 @@ async def create_session(
         "folder_id": body.folder_id,
         "status": "draft",
     })
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db). repo.create đã flush → id sẵn.
+    await db.flush()
     return GeneratorSessionResponse.model_validate(session)
 
 
@@ -1671,7 +1679,8 @@ async def update_session(
     if update_data:
         session = await repo.update(session_id, update_data)
 
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     return GeneratorSessionResponse.model_validate(session)
 
 
@@ -1810,6 +1819,9 @@ async def generate_from_session(
                 "folder_id": target_folder_id,
                 "edited_html": edited_html,
             })
+            # Phase 3 — COMMIT CỐ Ý (status-machine): persist trạng thái completed/failed
+            # của session. Nhánh except ghi status="failed" RỒI commit TRƯỚC `raise` →
+            # phải bền qua rollback của boundary. KHÔNG gỡ.
             await db.commit()
         except HTTPException:
             await repo.update(session_id, {"status": "failed", "error_message": "Manual-edit generation failed"})
@@ -1895,6 +1907,8 @@ async def generate_from_session(
             "document_id": final_document_id,
             "folder_id": target_folder_id,
         })
+        # Phase 3 — COMMIT CỐ Ý (status-machine): nhánh except ghi status="failed" RỒI
+        # commit TRƯỚC `raise` → phải bền qua rollback của boundary. KHÔNG gỡ.
         await db.commit()
     except HTTPException:
         await repo.update(session_id, {"status": "failed", "error_message": "Generation failed"})
@@ -1915,7 +1929,8 @@ async def delete_session(
     if session is None:
         raise HTTPException(404, "Session not found")
     await repo.delete(session_id)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
 
 
 # ─── Generator Session Versions (chỉnh sửa tay) ─────────────────────────────────
@@ -1951,7 +1966,8 @@ async def create_session_version(
     if body.field_values:
         update["field_values"] = body.field_values
     await repo.update(session_id, update)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     await db.refresh(version)
     return GeneratorSessionVersionResponse.model_validate(version)
 
@@ -1998,7 +2014,8 @@ async def update_session_version(
 
     if body.label is not None:
         version = await ver_repo.update(version_id, {"label": body.label})
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     await db.refresh(version)
     return GeneratorSessionVersionResponse.model_validate(version)
 
@@ -2021,7 +2038,8 @@ async def delete_session_version(
     if version is None:
         raise HTTPException(404, "Version not found")
     await ver_repo.delete(version_id)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
 
 
 # ─── AI đề xuất chỉnh sửa (block-based) ─────────────────────────────────────────
@@ -2289,7 +2307,8 @@ async def document_to_template(
     tmpl = await db.get(Document, template_id)
     if body.title and tmpl:
         tmpl.title = body.title
-        await db.commit()
+        # Phase 3: commit ở boundary (get_db).
+        await db.flush()
         await db.refresh(tmpl)
     title = tmpl.title if tmpl else (body.title or source_doc.title)
 

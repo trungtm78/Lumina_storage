@@ -122,6 +122,8 @@ class SkillContext:
         self.db.add(new_doc)
         await self.db.flush()
         await self.db.refresh(new_doc)
+        # Phase 3 — COMMIT CỐ Ý: artifact của skill/script là side-effect phải bền NGAY
+        # giữa luồng thực thi (song song agent.py:257 save_document_tool). KHÔNG gỡ.
         await self.db.commit()
         return new_doc.id
 
@@ -230,6 +232,8 @@ class SkillContext:
         self.db.add(new_doc)
         await self.db.flush()
         await self.db.refresh(new_doc)
+        # Phase 3 — COMMIT CỐ Ý: artifact PDF preview của skill/script là side-effect phải
+        # bền NGAY giữa luồng thực thi (song song agent.py:257). KHÔNG gỡ.
         await self.db.commit()
         return new_doc.id
 

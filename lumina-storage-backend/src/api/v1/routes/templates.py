@@ -187,7 +187,8 @@ async def update_template(
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(doc, "source_metadata")
 
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db) — chỉ flush để refresh đọc lại metadata.
+    await db.flush()
     await db.refresh(doc)
     return _build_template_response(doc)
 
@@ -292,7 +293,8 @@ async def update_template_fields(
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(doc, "source_metadata")
 
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db) — chỉ flush để refresh đọc lại metadata.
+    await db.flush()
     await db.refresh(doc)
     return _build_template_response(doc)
 
@@ -380,7 +382,8 @@ async def upload_template_file(
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(doc, "source_metadata")
 
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db) — chỉ flush để refresh đọc lại metadata.
+    await db.flush()
     await db.refresh(doc)
     return _build_template_response(doc)
 
@@ -444,7 +447,8 @@ async def rescan_template_fields(
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(doc, "source_metadata")
 
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db) — chỉ flush để refresh đọc lại metadata.
+    await db.flush()
     await db.refresh(doc)
     return _build_template_response(doc)
 
@@ -477,6 +481,8 @@ async def extract_template_from_document(
     meta["extraction_status"] = "pending"
     doc.source_metadata = meta
     flag_modified(doc, "source_metadata")
+    # Phase 3 — COMMIT CỐ Ý (commit-trước-enqueue): worker arq đọc ở session RIÊNG nên
+    # extraction_status="pending" phải bền TRƯỚC khi enqueue task bên dưới. KHÔNG gỡ.
     await db.commit()
 
     arq_pool = get_arq_pool(request)
@@ -529,6 +535,8 @@ async def extract_template_draft_endpoint(
     meta.pop("extraction_error", None)
     doc.source_metadata = meta
     flag_modified(doc, "source_metadata")
+    # Phase 3 — COMMIT CỐ Ý (commit-trước-enqueue): worker arq đọc ở session RIÊNG nên
+    # extraction_status="pending" phải bền TRƯỚC khi enqueue task bên dưới. KHÔNG gỡ.
     await db.commit()
 
     arq_pool = get_arq_pool(request)
