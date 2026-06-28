@@ -2760,6 +2760,8 @@ async def _persist_eval_pdf(
         await db.flush()
         await db.refresh(pdf_doc)
         job_row.pdf_document_id = pdf_doc.id
+        # Phase 3 — COMMIT CỐ Ý: _persist_eval_pdf chạy trong asyncio background (ngoài
+        # request boundary) → phải tự commit. KHÔNG gỡ.
         await db.commit()
         _log.info("_persist_eval_pdf: stored PDF %s for job %s", pdf_doc.id, job_row.id)
     except Exception:
@@ -2898,6 +2900,8 @@ async def start_review(
         report=report_dict,
     )
     db.add(job_row)
+    # Phase 3 — COMMIT CỐ Ý (commit-trước-background): job_row phải BỀN trước khi spawn
+    # _persist_eval_pdf (asyncio background đọc job_row + ghi pdf). KHÔNG gỡ.
     await db.commit()
 
     # 9. Fire-and-forget PDF pre-generation (không block response)
@@ -3337,7 +3341,8 @@ async def recalculate_score(
     row.report = report_data
     row.risk_score = new_score
     row.pdf_document_id = None  # Invalidate cached PDF — report đã thay đổi
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
 
     return {"newScore": new_score, "originalScore": base_score, "delta": delta, "summary": summary}
 
@@ -3385,7 +3390,8 @@ async def save_version(
     db.add(version)
     row.risk_score = body.score
     row.report = merged_result
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     await db.refresh(version)
 
     result_data = dict(version.result)
@@ -3479,7 +3485,8 @@ async def delete_history_item(
 
     row = await _load_job(db, job_id, current_user.id)
     row.deleted_at = datetime.now(tz.utc)
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     return {"status": "deleted", "job_id": job_id}
 
 
@@ -3492,7 +3499,8 @@ async def update_review_status(
 ):
     row = await _load_job(db, job_id, current_user.id)
     row.status = body.status
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     return {"job_id": job_id, "status": row.status}
 
 
@@ -3505,7 +3513,8 @@ async def save_session_events(
 ):
     row = await _load_job(db, job_id, current_user.id)
     row.session_events = [e.model_dump() for e in body.events]
-    await db.commit()
+    # Phase 3: commit ở boundary (get_db).
+    await db.flush()
     return {"job_id": job_id, "count": len(body.events)}
 
 

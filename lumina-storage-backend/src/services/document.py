@@ -436,7 +436,10 @@ class DocumentService:
             )
             .values(deleted_at=datetime.now(timezone.utc))
         )
-        await session.commit()
+        # Phase 3: commit ở boundary (get_db). delete_document gọi hàm này GIỮA chừng
+        # (trước cascade-cancel drafts) → gỡ commit để cả delete là MỘT transaction,
+        # tránh partial-commit nếu bước sau lỗi.
+        await session.flush()
 
     async def _permanent_delete_related_templates(self, doc_id, session, arq_pool) -> None:
         """Hard-delete any template documents derived from this source document."""
