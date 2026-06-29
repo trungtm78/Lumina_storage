@@ -13,7 +13,7 @@ from src.repositories.document import StorageConfigRepository
 from src.services.embedding_service import EmbeddingService
 from src.services.storage import get_storage_backend
 from src.services.template_service import extract_template, extract_template_draft
-from src.extraction.local_hybrid import LocalHybridProvider
+from src.extraction.selector import extract_with_fallback, resolve_extraction_chain
 from src.services.tokenizer import count_tokens
 from src.services.vector_service import ChunkPoint, VectorService
 
@@ -249,26 +249,16 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             backend = get_storage_backend(storage_config)
             file_bytes = await backend.read(document.file_path)
 
-            # 4. Extract text qua ExtractionProvider (Phase 5b). Task 1: LocalHybridProvider
-            # trực tiếp (selector chain ở Task 3). vlm chỉ resolve cho non-excel (giữ hành vi cũ
-            # — Excel-only deployment không cần AI config). LocalHybrid bọc cả 2 path nội bộ.
-            _EXCEL_EXTENSIONS = {".xlsx", ".xls", ".csv"}
-            if document.extension in _EXCEL_EXTENSIONS:
-                provider = LocalHybridProvider(gotenberg_url=settings.gotenberg_url)
-            else:
-                from src.services.ai_model_config_service import get_default_litellm_config
-
-                # Phase 4 T2: purpose 'vlm' (fallback 'chat' no-raise) — model + max_tokens riêng VLM.
-                vlm_cfg = await get_default_litellm_config(db, "vlm")
-                provider = LocalHybridProvider(
-                    gotenberg_url=settings.gotenberg_url,
-                    vlm_model=vlm_cfg.model,
-                    vlm_kwargs={k: v for k, v in vlm_cfg.to_kwargs().items() if k != "model"},
-                )
-            pages = await provider.extract(file_bytes, document.mime_type, document.extension)
+            # 4. Extract qua CHAIN provider (Phase 5b T3): routing config (mime/ext + priority)
+            # + fallback chain (LocalHybrid luôn cuối, vlm-aware). Config rỗng → chỉ LocalHybrid
+            # (zero-regression). Selector encapsulate vlm-resolve cho LocalHybrid.
+            chain = await resolve_extraction_chain(db, document, settings)
+            pages = await extract_with_fallback(
+                chain, file_bytes, document.mime_type, document.extension
+            )
             logger.info(
-                "[extract] document_id=%s provider=%s mime=%s ext=%s → %d page(s)",
-                document_id, provider.name, document.mime_type, document.extension, len(pages),
+                "[extract] document_id=%s chain=%s mime=%s ext=%s → %d page(s)",
+                document_id, [p.name for p in chain], document.mime_type, document.extension, len(pages),
             )
 
             if not pages:
@@ -319,6 +309,7 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             from langchain_core.documents import Document as LCDocument
             from langchain_text_splitters import MarkdownHeaderTextSplitter
 
+            _EXCEL_EXTENSIONS = {".xlsx", ".xls", ".csv"}  # chunking Excel = 1 row/chunk
             final_chunks: list[tuple] = []  # (LangChain doc, page_number)
 
             if document.extension in _EXCEL_EXTENSIONS:

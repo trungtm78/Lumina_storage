@@ -83,7 +83,10 @@ def _patch_all(monkeypatch, extractor=_FakeExtractor):
 
     monkeypatch.setattr(d, "EmbeddingService", _FakeEmbed)
     monkeypatch.setattr(d, "VectorService", _FakeVector)
-    monkeypatch.setattr(d, "LocalHybridProvider", extractor)  # seam Phase 5b: provider
+    # seam Phase 5b T3: resolve_extraction_chain → [provider]; extract_with_fallback (thật) gọi extract.
+    async def _fake_chain(db, document, settings):
+        return [extractor()]
+    monkeypatch.setattr(d, "resolve_extraction_chain", _fake_chain)
     monkeypatch.setattr(d, "get_storage_backend", lambda cfg: _FakeBackend())
     monkeypatch.setattr(
         "src.services.ai_model_config_service.get_default_litellm_config", _fake_get_default
