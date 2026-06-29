@@ -10,7 +10,6 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-import litellm
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -554,13 +553,8 @@ async def draft_document(
         {"role": "user", "content": user_prompt},
     ]
 
-    from src.services.ai_model_config_service import get_default_litellm_config
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
-    response = await litellm.acompletion(
-        messages=messages,
-        stream=False,
-        **_llm_kwargs,
-    )
+    from src.ai import AIGateway
+    response = await AIGateway(db).complete(messages)
     import re as _re
     content: str = response.choices[0].message.content or ""
     content = _re.sub(r"\{\{(\w+)\}\}", r"{\1}", content)
@@ -579,9 +573,7 @@ async def revise_document(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    from src.services.ai_model_config_service import get_default_litellm_config
-
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
+    from src.ai import AIGateway
 
     messages = [
         {
@@ -602,11 +594,7 @@ async def revise_document(
         },
     ]
 
-    response = await litellm.acompletion(
-        messages=messages,
-        stream=False,
-        **_llm_kwargs,
-    )
+    response = await AIGateway(db).complete(messages)
     import re as _re
     content: str = response.choices[0].message.content or ""
     content = _re.sub(r"\{\{(\w+)\}\}", r"{\1}", content)
@@ -683,16 +671,11 @@ async def map_columns(
         "Chỉ ánh xạ các cột có placeholder tương ứng. Bỏ qua cột không có placeholder phù hợp."
     )
 
-    from src.services.ai_model_config_service import get_default_litellm_config
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
-    response = await litellm.acompletion(
-        messages=[
-            {"role": "system", "content": "Bạn chỉ trả về JSON, không có markdown hay giải thích."},
-            {"role": "user", "content": prompt},
-        ],
-        stream=False,
-        **_llm_kwargs,
-    )
+    from src.ai import AIGateway
+    response = await AIGateway(db).complete([
+        {"role": "system", "content": "Bạn chỉ trả về JSON, không có markdown hay giải thích."},
+        {"role": "user", "content": prompt},
+    ])
     raw = (response.choices[0].message.content or "").strip()
     # strip markdown fences if any
     if raw.startswith("```"):
@@ -997,16 +980,11 @@ async def extract_from_file(
         "Không điền nếu không chắc chắn hoặc không có thông tin."
     )
 
-    from src.services.ai_model_config_service import get_default_litellm_config
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
-    response = await litellm.acompletion(
-        messages=[
-            {"role": "system", "content": "Bạn chỉ trả về JSON thuần, không có markdown hay giải thích."},
-            {"role": "user", "content": prompt},
-        ],
-        stream=False,
-        **_llm_kwargs,
-    )
+    from src.ai import AIGateway
+    response = await AIGateway(db).complete([
+        {"role": "system", "content": "Bạn chỉ trả về JSON thuần, không có markdown hay giải thích."},
+        {"role": "user", "content": prompt},
+    ])
     raw = (response.choices[0].message.content or "").strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:])
@@ -1114,16 +1092,11 @@ async def extract_from_text(
         "Không điền nếu không chắc chắn hoặc không có thông tin."
     )
 
-    from src.services.ai_model_config_service import get_default_litellm_config
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
-    response = await litellm.acompletion(
-        messages=[
-            {"role": "system", "content": "Bạn chỉ trả về JSON thuần, không có markdown hay giải thích."},
-            {"role": "user", "content": prompt},
-        ],
-        stream=False,
-        **_llm_kwargs,
-    )
+    from src.ai import AIGateway
+    response = await AIGateway(db).complete([
+        {"role": "system", "content": "Bạn chỉ trả về JSON thuần, không có markdown hay giải thích."},
+        {"role": "user", "content": prompt},
+    ])
     raw = (response.choices[0].message.content or "").strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:])
@@ -2071,11 +2044,29 @@ def _strip_json_fence(raw: str) -> str:
     return s.strip()
 
 
+async def _consume_stream_with_disconnect(stream, request) -> str:
+    """Tiêu thụ async stream text-delta, RAISE HTTPException(499) nếu client ngắt
+    giữa chừng (Phase 4 T5b — tách module-level để test được).
+
+    Disconnect được kiểm tra mỗi lần nhận một text-delta (``gateway.stream`` chỉ
+    yield delta khác rỗng). Khi generate, content token về liên tục nên 499 vẫn
+    bắt kịp thời (chỉ không check trên các chunk rỗng cuối stream — lúc đó đã
+    generate xong). Raise trong ``async for`` đẩy GeneratorExit lan ngược chuỗi
+    generator → provider connection được dọn theo cơ chế cleanup của asyncio
+    (giống hành vi code cũ trước khi qua gateway; KHÔNG phải cam kết hủy tức thì)."""
+    accumulated = ""
+    async for delta in stream:
+        if await request.is_disconnected():
+            raise HTTPException(499, "Client disconnected")
+        accumulated += delta
+    return accumulated
+
+
 async def _llm_propose_ops(
     db: AsyncSession, text_map: dict[str, str], instructions: list[str],
 ) -> tuple[list[BlockEditOp], list[str]]:
     """Gọi LLM → danh sách op đã validate. Trả (ops, warnings)."""
-    from src.services.ai_model_config_service import get_default_litellm_config
+    from src.ai import AIGateway
 
     warnings: list[str] = []
     blocks_lines = "\n".join(f"[{bid}] {txt}" for bid, txt in text_map.items())
@@ -2089,16 +2080,13 @@ async def _llm_propose_ops(
         {"role": "system", "content": _AI_REVISE_SYSTEM},
         {"role": "user", "content": user_prompt},
     ]
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
+    gw = AIGateway(db)
 
     raw = ""
     for attempt in range(2):
         try:
-            resp = await litellm.acompletion(
-                messages=messages,
-                stream=False,
-                response_format={"type": "json_object"},
-                **_llm_kwargs,
+            resp = await gw.complete(
+                messages, response_format={"type": "json_object"}
             )
             raw = resp.choices[0].message.content or ""
             data = json.loads(_strip_json_fence(raw))
@@ -2223,8 +2211,8 @@ async def document_to_template(
     (`template_service`): location-based + replace ở mức run → GIỮ NGUYÊN FORMAT
     gốc (font, bảng, heading, header/footer). Có chunking cho tài liệu dài.
     """
+    from src.ai import AIGateway
     from src.schemas.template import TemplateFieldResponse
-    from src.services.ai_model_config_service import get_default_litellm_config
     # Dùng BẢN SAO RIÊNG của generator (duplicate luồng Beta) — không đụng template_service.py
     from src.services.generator_template_service import commit_template, extract_template_draft
 
@@ -2261,23 +2249,15 @@ async def document_to_template(
     if await request.is_disconnected():
         raise HTTPException(499, "Client disconnected")
 
-    # llm_call streaming — cùng signature với non-streaming, service không cần biết
-    # Streaming cho phép Azure dừng generate ngay khi client ngắt → tiết kiệm usage
-    _llm_kwargs = (await get_default_litellm_config(db, "chat")).to_kwargs()
+    # llm_call streaming — cùng signature với non-streaming, service không cần biết.
+    # Streaming cho phép Azure dừng generate ngay khi client ngắt → tiết kiệm usage.
+    gw = AIGateway(db)
 
     async def llm_call(messages, response_format=None):
-        kwargs = {"messages": messages, "stream": True, **_llm_kwargs}
-        if response_format:
-            kwargs["response_format"] = response_format
-        stream = await litellm.acompletion(**kwargs)
-        accumulated = ""
-        async for chunk in stream:
-            if await request.is_disconnected():
-                # Raise inside async for → Python gọi stream.aclose() tự động
-                # → đóng TCP connection tới Azure → Azure dừng generate
-                raise HTTPException(499, "Client disconnected")
-            accumulated += chunk.choices[0].delta.content or ""
-        return accumulated
+        overrides = {"response_format": response_format} if response_format else {}
+        return await _consume_stream_with_disconnect(
+            gw.stream(messages, **overrides), request
+        )
 
     # 1) Trích field theo location — không side effect
     draft = await extract_template_draft(db, body.document_id, llm_call=llm_call)
