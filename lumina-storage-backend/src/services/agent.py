@@ -4,7 +4,7 @@ Foundational Tools + Dynamic Skills architecture.
 Agent reads SKILL.md via read_file, runs scripts via run_script.
 
 Tools: read_file, write_file, list_directory, search_files,
-       parse_document, run_script, query_vector_db
+       parse_document, run_script, rag_search
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -34,6 +35,20 @@ from src.repositories.document import DocumentRepository
 # ── Deps ───────────────────────────────────────────────────────────────
 
 
+class Citation(TypedDict, total=False):
+    """Phase 4 T6 — shape DUY NHẤT cho collector.search_results (1 nguồn citation).
+
+    MỌI điểm set collector.search_results phải dùng shape này: rag_search (vector
+    search) + parse_document `_sources` (skill script). total=False → key có thể
+    thiếu (skill _sources không bảo đảm đủ); consumer dùng .get() resilient.
+    document_id/chunk_id là str (UUID dạng chuỗi)."""
+    document_id: str
+    chunk_id: str | None
+    page_number: int | None
+    content: str
+    score: float | None
+
+
 @dataclass
 class SkillDoneResult:
     rendered_document_id: str
@@ -44,7 +59,7 @@ class SkillDoneResult:
 @dataclass
 class AgentResultCollector:
     """Mutable container for tools to communicate results back to SSE route."""
-    search_results: list = field(default_factory=list)
+    search_results: list[Citation] = field(default_factory=list)
     skill_done: SkillDoneResult | None = None
     last_script_path: str | None = None
     skill_state: dict = field(default_factory=dict)
@@ -549,7 +564,8 @@ async def run_script(
             applied_count=result.get("applied_count", 0),
         )
 
-    # Track sources
+    # Track sources — skill script phải trả `_sources` theo shape Citation (xem
+    # AgentResultCollector.search_results); consumer chat_service dùng .get() resilient.
     if result.get("_sources"):
         deps.collector.search_results = result["_sources"]
 
@@ -561,50 +577,6 @@ async def run_script(
 
     response = {k: v for k, v in result.items() if not k.startswith("_")}
     return json.dumps(response, ensure_ascii=False)
-
-
-# ── Tool 7: query_vector_db ───────────────────────────────────────────
-
-@tool
-async def query_vector_db(
-    query: str,
-    top_k: int = 5,
-    config: RunnableConfig = None,
-) -> str:
-    """Tìm kiếm semantic trong vector database (documents).
-
-    Args:
-        query: Natural language query.
-        top_k: Số kết quả (default 5).
-    """
-    deps = _get_deps(config)
-    query_vector = await deps.embedding_svc.embed_query(query)
-
-    from src.repositories.document import DocumentRepository
-    from src.services.document_permission import DocumentPermissionService
-
-    perm_svc = DocumentPermissionService(deps.db)
-    group_ids = await perm_svc.get_user_group_ids(deps.user)
-    acl_doc_ids = await DocumentRepository(deps.db).get_acl_only_ids(
-        deps.user.id, group_ids
-    )
-
-    results = await deps.vector_svc.search(
-        query_vector=query_vector,
-        top_k=top_k,
-        owner_id=deps.user.id,
-        acl_doc_ids=acl_doc_ids,
-    )
-
-    deps.collector.search_results = results
-
-    if not results:
-        return "Không tìm thấy nội dung liên quan."
-
-    parts = []
-    for i, r in enumerate(results, 1):
-        parts.append(f"[{i}] (trang {r.page_number})\n{r.content}")
-    return "\n\n".join(parts)
 
 
 # ── Tool 8: search_templates ──────────────────────────────────────────

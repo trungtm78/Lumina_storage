@@ -24,6 +24,7 @@ from src.repositories.document import DocumentRepository
 from src.services.agent import (
     AgentDeps,
     AgentResultCollector,
+    Citation,
     build_model,
     build_system_prompt,
     convert_history,
@@ -86,6 +87,54 @@ async def _generate_title_background(
             await db.commit()
     except Exception:
         logger.debug("Background title generation failed", exc_info=True)
+
+
+def _coerce_uuid(v) -> uuid.UUID | None:
+    """UUID nếu hợp lệ (UUID hoặc str UUID), None nếu không — dùng cho cột UUID FK."""
+    if isinstance(v, uuid.UUID):
+        return v
+    if isinstance(v, str):
+        try:
+            return uuid.UUID(v)
+        except ValueError:
+            return None
+    return None
+
+
+def citation_to_source(
+    c: "Citation", message_id, citation_index: int
+) -> ChatMessageSource:
+    """Phase 4 T6 — map MỘT Citation dict (collector.search_results) → ChatMessageSource.
+
+    Một shape duy nhất (dict) sau khi xóa query_vector_db: dùng .get() resilient cho
+    cả rag_search lẫn parse_document `_sources` (có thể thiếu key). document_id/chunk_id
+    coerce str→UUID (chunk_id không-UUID → None, cột nullable). excerpt rỗng → None
+    (đồng nhất simple-chat path). Caller (citations_to_sources) đã đảm bảo document_id
+    hợp lệ trước khi gọi."""
+    content = c.get("content") or ""
+    return ChatMessageSource(
+        message_id=message_id,
+        document_id=_coerce_uuid(c.get("document_id")),
+        chunk_id=_coerce_uuid(c.get("chunk_id")),
+        citation_index=citation_index,
+        page_number=c.get("page_number"),
+        relevance_score=c.get("score"),
+        excerpt=content[:500] if content else None,
+    )
+
+
+def citations_to_sources(citations, message_id) -> list[ChatMessageSource]:
+    """Phase 4 T6 — build list ChatMessageSource từ collector.search_results (Citation
+    dicts). Resilient với skill _sources lỗi (tránh poison commit/crash chat): BỎ entry
+    không phải dict, hoặc document_id thiếu/không-UUID (cột NOT NULL FK). citation_index
+    liên tục 1..N theo entry hợp lệ (không gap). Entry bị bỏ → log cảnh báo (không im lặng)."""
+    sources: list[ChatMessageSource] = []
+    for c in citations:
+        if not isinstance(c, dict) or _coerce_uuid(c.get("document_id")) is None:
+            logger.warning("Bỏ citation lỗi (không dict hoặc document_id không hợp lệ): %r", c)
+            continue
+        sources.append(citation_to_source(c, message_id, len(sources) + 1))
+    return sources
 
 
 class ChatService:
@@ -674,20 +723,11 @@ class ChatService:
         self.db.add(assistant_msg)
         await self.db.flush()
 
-        # 10. Save sources from vector search (if agent used query_vector_db)
-        search_results = collector.search_results
-        if search_results:
-            for i, r in enumerate(search_results, 1):
-                source = ChatMessageSource(
-                    message_id=assistant_msg.id,
-                    document_id=r.document_id if hasattr(r, "document_id") else r.get("document_id"),
-                    chunk_id=r.chunk_id if hasattr(r, "chunk_id") else r.get("chunk_id"),
-                    citation_index=i,
-                    page_number=r.page_number if hasattr(r, "page_number") else r.get("page_number"),
-                    relevance_score=r.score if hasattr(r, "score") else r.get("score"),
-                    excerpt=(r.content if hasattr(r, "content") else r.get("content", ""))[:500],
-                )
-                self.db.add(source)
+        # 10. Save sources from collector (rag_search / parse_document _sources).
+        # Phase 4 T6: collector.search_results giờ MỘT shape (Citation dict) sau khi xóa
+        # query_vector_db → citations_to_sources (dict-only + bỏ entry thiếu document_id).
+        for source in citations_to_sources(collector.search_results, assistant_msg.id):
+            self.db.add(source)
 
         # Save ID before expire_all to avoid lazy-load in async context
         assistant_msg_id = assistant_msg.id
