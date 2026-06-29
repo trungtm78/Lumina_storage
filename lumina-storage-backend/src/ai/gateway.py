@@ -100,15 +100,26 @@ class AIGateway:
         return ChatLiteLLM(**kwargs)
 
     async def langgraph_model(self, **overrides: Any):
-        """LangChain chat model cho agent (LangGraph build_model). purpose 'chat'."""
+        """LangChain chat model cho agent (LangGraph build_model). purpose 'chat'.
+
+        Phase 4 T7: forward generation params (max_tokens/temperature/extra) xuống
+        build_model — đối xứng với langchain_model. build_model nay nhận **extra (T7),
+        nên admin extra_config tới được model. overrides per-call THẮNG config (C1)."""
         from src.services.agent import build_model
 
         cfg = await get_default_litellm_config(self._db, "chat")
         self._trace("llm.langgraph_model", model=cfg.model)
+        extra: dict = {}
+        if cfg.max_tokens is not None:
+            extra["max_tokens"] = cfg.max_tokens
+        if cfg.temperature is not None:
+            extra["temperature"] = cfg.temperature
+        extra.update(cfg.extra)
+        extra.update(overrides)  # per-call overrides thắng config
         return build_model(
             cfg.model,
             api_key=cfg.api_key,
             api_base=cfg.api_base,
             api_version=cfg.api_version,
-            **overrides,
+            **extra,
         )

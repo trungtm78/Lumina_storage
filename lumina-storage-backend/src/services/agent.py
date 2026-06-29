@@ -15,7 +15,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -698,9 +698,14 @@ def build_model(
     api_key: str | None = None,
     api_base: str | None = None,
     api_version: str | None = None,
-    **extra: str,
+    **extra: Any,
 ):
-    """Build a LangChain chat model."""
+    """Build a LangChain chat model.
+
+    Phase 4 T7: **extra (vd temperature/max_tokens) được FORWARD xuống constructor —
+    trước đây bị drop (codex T3 P2). gateway.langgraph_model(**overrides) nhờ đó truyền
+    được generation params. Path LIVE stream_agent KHÔNG truyền extra → không đổi hành vi.
+    Caller chịu trách nhiệm truyền key hợp lệ với từng provider."""
     if model_str.startswith("azure/"):
         model_name = model_str.removeprefix("azure/")
         return AzureChatOpenAI(
@@ -708,6 +713,7 @@ def build_model(
             azure_endpoint=api_base or "",
             api_key=api_key or "",
             api_version=api_version or "2024-12-01-preview",
+            **extra,
         )
 
     if model_str.startswith("gemini/"):
@@ -716,6 +722,7 @@ def build_model(
         return ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=api_key or "",
+            **extra,
         )
 
     if model_str.startswith("anthropic/"):
@@ -725,6 +732,7 @@ def build_model(
             model=model_name,
             api_key=api_key or "",
             base_url=api_base or None,
+            **extra,
         )
 
     if model_str.startswith("ollama/"):
@@ -733,10 +741,12 @@ def build_model(
         return ChatOllama(
             model=model_name,
             base_url=api_base or "http://localhost:11434",
+            **extra,
         )
 
     return ChatOpenAI(
         model=model_str,
         api_key=api_key or "",
         base_url=api_base,
+        **extra,
     )

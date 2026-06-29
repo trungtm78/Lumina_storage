@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     # Skills system (local apps uploaded via Apps menu)
     skills_dir: str = "skills"
 
+    # Phase 4 T7 — rollout gate cho luồng chat hợp nhất. Default False = giữ luồng
+    # hiện tại (route chỉ dùng stream_agent; citation lifecycle đã hợp nhất ở T6 qua
+    # collector→citations_to_sources). Bật khi/ nếu wire thêm "simple strategy" qua
+    # cùng pipeline citation, sau khi golden (tests/test_golden_chat_phase4.py) đạt.
+    chat_unified_stream: bool = False
+
     # Lumina SSO
     lumina_sso_service_url: str = ""  # URL của lumina-sso-service, VD: http://localhost:3100
 
