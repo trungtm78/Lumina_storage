@@ -640,15 +640,15 @@ async def rag_search(query: str, top_k: int = 5, config: RunnableConfig = None) 
         top_k: Số kết quả trả về (mặc định 5).
     """
     deps = _get_deps(config)
-    query_vector = await deps.embedding_svc.embed_query(query)
     perm_svc = DocumentPermissionService(deps.db)
     group_ids = await perm_svc.get_user_group_ids(deps.user)
     acl_doc_ids = await DocumentRepository(deps.db).get_acl_only_ids(deps.user.id, group_ids)
-    results = await deps.vector_svc.search(
-        query_vector=query_vector,
-        top_k=top_k,
-        owner_id=deps.user.id,
-        acl_doc_ids=acl_doc_ids,
+    # Phase 5a Task 3: qua RetrievalService.hybrid_search (vector + FTS chunk-level + RRF) —
+    # lọc active_ingest_version (R2, bỏ stale/orphan blue/green), ACL 2 phía (R5), query NFC (R6).
+    from src.services.retrieval_service import RetrievalService
+
+    results = await RetrievalService(deps.db, deps.vector_svc, deps.embedding_svc).hybrid_search(
+        query, top_k=top_k, owner_id=deps.user.id, acl_doc_ids=acl_doc_ids
     )
     if not results:
         return "Không tìm thấy thông tin liên quan trong tài liệu."

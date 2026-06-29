@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text as _sa_text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -34,6 +35,9 @@ async def _enqueue_test_job(*_args, **_kwargs):
 async def test_engine():
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
     async with engine.begin() as conn:
+        # Phase 5a: FTS dùng unaccent (test DB build từ create_all, không qua migration
+        # 20260428a002 vốn tạo extension này) → tạo ở đây cho test hybrid retrieval.
+        await conn.execute(_sa_text("CREATE EXTENSION IF NOT EXISTS unaccent"))
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield engine

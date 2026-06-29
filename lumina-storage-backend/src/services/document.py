@@ -259,12 +259,17 @@ class DocumentService:
         if q and search_mode == "semantic":
             from src.core.config import get_settings as _get_settings
             from src.services.embedding_service import EmbeddingService
+            from src.services.retrieval_service import RetrievalService
             from src.services.vector_service import VectorService
             settings = _get_settings()
             embedding_svc = await EmbeddingService.from_db_default(self.db)
             vector_svc = VectorService(settings)
-            query_vec = await embedding_svc.embed_query(q)
-            results = await vector_svc.search(query_vec, top_k=50)
+            # Phase 5a Task 3: qua RetrievalService — lọc active_ingest_version (R2: bỏ stale
+            # blue/green) + hybrid FTS. Doc-level search (dedup document_id; ACL lọc ở tầng list
+            # sau, giữ nguyên hành vi cũ không truyền owner/acl ở đây).
+            results = await RetrievalService(self.db, vector_svc, embedding_svc).hybrid_search(
+                q, top_k=50
+            )
             seen: set[uuid.UUID] = set()
             semantic_doc_ids = []
             for r in results:
