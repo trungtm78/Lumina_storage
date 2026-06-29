@@ -32,6 +32,81 @@ class _IngestSkip(Exception):
         self.result = result
 
 
+# ── Multi-page chunking (Phase 5a T3/R9) ─────────────────────────────────────
+import re as _re  # noqa: E402
+
+_CHUNK_SIZE = 1800           # ~câu/đoạn cho RAG (thay "1 page = 1 chunk ≤24000")
+_CHUNK_OVERLAP = 180
+_TABLE_CHAR_RATIO = 0.5      # R9 (codex): page table-DOMINATED theo KÝ TỰ (≥50% char thuộc
+                             # dòng table cột-0). Char-ratio chuẩn hơn line-ratio: prose 1 dòng
+                             # dài + bảng nhỏ KHÔNG bị phân loại nhầm table-heavy.
+_TABLE_MIN_LINES = 3
+_TABLE_MAX_CHARS = 12000     # giới hạn 1 row-group chunk (giữ header + nguyên hàng)
+
+
+def _split_table_by_rows(text: str, max_chars: int = _TABLE_MAX_CHARS) -> list[str]:
+    """Split markdown table thành chunks theo char limit, mỗi chunk GIỮ header + nguyên
+    hàng (KHÔNG cắt giữa hàng). Không phải table → trả [text]."""
+    lines = text.splitlines()
+    header_lines: list[str] = []
+    data_lines: list[str] = []
+    found_separator = False
+    for line in lines:
+        if not found_separator:
+            header_lines.append(line)
+            if _re.match(r"^\|[\s\-:|]+\|", line):
+                found_separator = True
+        elif line.strip():
+            data_lines.append(line)
+    if not data_lines or not found_separator:
+        return [text]
+    header = "\n".join(header_lines)
+    chunks: list[str] = []
+    current_rows: list[str] = []
+    current_len = len(header)
+    for row in data_lines:
+        if current_rows and current_len + len(row) + 1 > max_chars:
+            chunks.append(header + "\n" + "\n".join(current_rows))
+            current_rows = []
+            current_len = len(header)
+        current_rows.append(row)
+        current_len += len(row) + 1
+    if current_rows:
+        chunks.append(header + "\n" + "\n".join(current_rows))
+    return chunks or [text]
+
+
+def _is_table_heavy(text: str) -> bool:
+    """R9: page table-DOMINATED theo KÝ TỰ. Dòng table = cột-0 '|' (khớp _split_table_by_rows
+    separator ^\\|, tránh table thụt lề bị split fail). char-ratio thay line-ratio: prose 1
+    dòng dài + bảng nhỏ KHÔNG bị nhầm table-heavy (codex)."""
+    if not text:
+        return False
+    table_lines = [line for line in text.splitlines() if line.startswith("|")]
+    if len(table_lines) < _TABLE_MIN_LINES:
+        return False
+    table_chars = sum(len(line) for line in table_lines)
+    return table_chars / len(text) >= _TABLE_CHAR_RATIO
+
+
+def _chunk_pages(pages) -> list[tuple[int, str]]:
+    """Phase 5a T3: multi-page → chunk theo câu ~1800 (chunk_by_sentences) GIỮ page_number;
+    table-heavy → _split_table_by_rows (R9, không cắt giữa hàng). Trả [(page_number, text)]."""
+    from src.services.text_chunking import chunk_by_sentences
+
+    out: list[tuple[int, str]] = []
+    for page in pages:
+        if _is_table_heavy(page.text):
+            for chunk_text in _split_table_by_rows(page.text):
+                out.append((page.page_number, chunk_text))
+        else:
+            for chunk_text in chunk_by_sentences(
+                page.text, chunk_size=_CHUNK_SIZE, chunk_overlap=_CHUNK_OVERLAP
+            ):
+                out.append((page.page_number, chunk_text))
+    return out
+
+
 async def mark_ingest_status(session_factory, task_id: uuid.UUID, status: str, **fields) -> None:
     """Phase 3 T5 — checkpoint status ở SESSION RIÊNG (độc lập transaction business).
 
@@ -217,6 +292,11 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                 # đây sẽ rollback business — không set trên session business (sẽ mất).
                 raise _IngestSkip({"page_count": 0, "chunk_count": 0, "skipped": True})
 
+            # Phase 5a T2 (codex): chuẩn hóa NFC TẤT CẢ page ở MỘT điểm — gồm Excel/CSV
+            # (parse_xlsx bypass extract()). Idempotent với normal path (đã NFC ở extract()).
+            from src.services.text_extraction_service import PageResult as _PR, _nfc
+            pages = [_PR(page_number=p.page_number, text=_nfc(p.text), confidence=p.confidence) for p in pages]
+
             # 5. Upsert DocumentContent (raw_text = joined markdown)
             full_markdown = "\n\n".join(p.text for p in pages)
             existing_content = await db.get(DocumentContent, document_id)
@@ -248,7 +328,7 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             #    - 1 page (txt/md/docx)  → chunk by markdown section
             #    - nhiều page (pdf/pptx) → 1 page = 1 chunk (fallback split nếu page > 24000 chars)
             from langchain_core.documents import Document as LCDocument
-            from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+            from langchain_text_splitters import MarkdownHeaderTextSplitter
 
             final_chunks: list[tuple] = []  # (LangChain doc, page_number)
 
@@ -276,63 +356,14 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                     final_chunks.append((chunk, pages[0].page_number))
                 logger.info("[chunking] single-page → %d section chunk(s) (VN sentence-aware)", len(section_chunks))
             else:
-                # Multi-page document: 1 page = 1 chunk
-                # XLSX sheets có thể là bảng rất lớn → chunk theo row groups
-                import re as _re
-
-                def _split_table_by_rows(text: str, max_chars: int = 12000) -> list[str]:
-                    """Split markdown table thành chunks theo char limit, mỗi chunk giữ header."""
-                    lines = text.splitlines()
-                    header_lines: list[str] = []
-                    data_lines: list[str] = []
-                    found_separator = False
-                    for line in lines:
-                        if not found_separator:
-                            header_lines.append(line)
-                            if _re.match(r"^\|[\s\-:|]+\|", line):
-                                found_separator = True
-                        else:
-                            if line.strip():
-                                data_lines.append(line)
-                    if not data_lines or not found_separator:
-                        return [text]
-                    header = "\n".join(header_lines)
-                    chunks: list[str] = []
-                    current_rows: list[str] = []
-                    current_len = len(header)
-                    for row in data_lines:
-                        if current_rows and current_len + len(row) + 1 > max_chars:
-                            chunks.append(header + "\n" + "\n".join(current_rows))
-                            current_rows = []
-                            current_len = len(header)
-                        current_rows.append(row)
-                        current_len += len(row) + 1
-                    if current_rows:
-                        chunks.append(header + "\n" + "\n".join(current_rows))
-                    return chunks or [text]
-
-                def _is_table_heavy(text: str) -> bool:
-                    """True nếu text chủ yếu là markdown table."""
-                    table_lines = sum(1 for line in text.splitlines() if line.startswith("|"))
-                    return table_lines > 10 and table_lines / max(len(text.splitlines()), 1) > 0.5
-
-                from src.services.text_chunking import chunk_by_sentences as _vi_chunk
-
-                for page in pages:
-                    if len(page.text) <= 24000:
-                        final_chunks.append((LCDocument(page_content=page.text), page.page_number))
-                        logger.info("[chunking] page_number=%s → 1 chunk (%d chars)", page.page_number, len(page.text))
-                    elif _is_table_heavy(page.text):
-                        table_chunks = _split_table_by_rows(page.text)
-                        for chunk_text in table_chunks:
-                            final_chunks.append((LCDocument(page_content=chunk_text), page.page_number))
-                        logger.info("[chunking] page_number=%s → %d row-group chunks (table, %d chars)", page.page_number, len(table_chunks), len(page.text))
-                    else:
-                        # Vietnamese-aware split for long prose pages
-                        splits = _vi_chunk(page.text, chunk_size=24000, chunk_overlap=500)
-                        for chunk_text in splits:
-                            final_chunks.append((LCDocument(page_content=chunk_text), page.page_number))
-                        logger.info("[chunking] page_number=%s → %d chunks (VN-aware fallback, %d chars)", page.page_number, len(splits), len(page.text))
+                # Phase 5a T3/R9: multi-page → chunk theo câu ~1800 GIỮ page_number;
+                # table-heavy giữ _split_table_by_rows (không cắt giữa hàng). Helper module-level.
+                for page_num, chunk_text in _chunk_pages(pages):
+                    final_chunks.append((LCDocument(page_content=chunk_text), page_num))
+                logger.info(
+                    "[chunking] multi-page → %d chunk(s) (VN sentence + table-aware)",
+                    len(final_chunks),
+                )
 
             logger.info(
                 "[chunking] document_id=%s total=%d chunks, page_number distribution: %s",

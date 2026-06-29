@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 
 from dataclasses import dataclass
 
@@ -15,6 +16,11 @@ class PageResult:
     confidence: float
 
 logger = logging.getLogger(__name__)
+
+
+def _nfc(s: str) -> str:
+    """Chuẩn hóa NFC (tổ hợp dấu tiếng Việt) — Phase 5a T2. Rỗng/None → giữ nguyên."""
+    return unicodedata.normalize("NFC", s) if s else s
 
 _PPTX_EXTRACT_PROMPT = """Bạn là công cụ extract nội dung slide thành Markdown phục vụ RAG (Retrieval-Augmented Generation).
 
@@ -56,6 +62,17 @@ class TextExtractionService:
         self._vlm_kwargs.setdefault("max_tokens", self._VLM_DEFAULT_MAX_TOKENS)
 
     async def extract(
+        self, file_bytes: bytes, mime_type: str, extension: str
+    ) -> list[PageResult]:
+        """Trích xuất → list[PageResult]. Phase 5a T2: chuẩn hóa NFC tiếng Việt ở MỘT điểm
+        (PyMuPDF/VLM/MarkItDown có thể trả NFD) cho mọi page trước khi trả về."""
+        pages = await self._extract_dispatch(file_bytes, mime_type, extension)
+        return [
+            PageResult(page_number=p.page_number, text=_nfc(p.text), confidence=p.confidence)
+            for p in pages
+        ]
+
+    async def _extract_dispatch(
         self, file_bytes: bytes, mime_type: str, extension: str
     ) -> list[PageResult]:
         if mime_type == "application/pdf" or extension == ".pdf":
