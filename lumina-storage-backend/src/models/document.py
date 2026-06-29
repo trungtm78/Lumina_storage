@@ -55,6 +55,9 @@ class Document(TimestampMixin, Base):
     source_metadata: Mapped[dict | None] = mapped_column(JSONB)
     page_count: Mapped[int | None] = mapped_column(Integer)
     language: Mapped[str | None] = mapped_column(String(20))
+    # Phase 5a blue/green: con trỏ version ingest đang PHỤC VỤ. Swap nguyên tử tại DB
+    # commit cuối ingest. reads lọc chunk theo version này (R2). NULL = chưa ingest xong.
+    active_ingest_version: Mapped[str | None] = mapped_column(Text)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     starred: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     image_thumbnail: Mapped[str | None] = mapped_column(String(2048))
@@ -129,11 +132,19 @@ class DocumentChunk(Base):
     token_count: Mapped[int | None] = mapped_column(Integer)
     page_number: Mapped[int | None] = mapped_column(Integer)
     qdrant_point_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), unique=True)
+    # Phase 5a blue/green: version ingest gắn mỗi chunk. 2 version cùng (doc, index) coexist
+    # trong cửa sổ swap → version VÀO unique key. reads lọc theo document.active_ingest_version.
+    # NOT NULL + server_default 'legacy' (codex P2): tránh NULL bypass unique + reads NULL==NULL
+    # miss; current ingest chưa set version vẫn lấp 'legacy' qua default, T1 set version thật.
+    ingest_version: Mapped[str] = mapped_column(Text, nullable=False, server_default="legacy")
+    # Phase 5a A1: FTS chunk-level (to_tsvector('simple', unaccent(content))) cho hybrid retrieval.
+    search_vector: Mapped[str | None] = mapped_column(TSVECTOR)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint("document_id", "chunk_index", name="uq_documentchunk_doc_index"),
+        UniqueConstraint("document_id", "chunk_index", "ingest_version", name="uq_documentchunk_doc_index_version"),
         Index("idx_documentchunk_document", "document_id"),
+        Index("idx_documentchunk_fts", "search_vector", postgresql_using="gin"),
     )
 
     document: Mapped["Document"] = relationship("Document", back_populates="chunks")
