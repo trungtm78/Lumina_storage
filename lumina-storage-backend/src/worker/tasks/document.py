@@ -437,6 +437,23 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
     return result
 
 
+def _build_template_llm_call(db: AsyncSession):
+    """Phase 4 T5c: dựng `llm_call` (non-stream, trả content) qua AIGateway cho
+    extract_template/draft worker. Dùng CHUNG cho cả 2 task (gỡ trùng lặp).
+    `complete()` force stream=False (extraction deterministic); response_format
+    forward qua overrides chỉ khi caller truyền."""
+    from src.ai import AIGateway
+
+    gw = AIGateway(db)
+
+    async def llm_call(messages, response_format=None):
+        overrides = {"response_format": response_format} if response_format else {}
+        resp = await gw.complete(messages, **overrides)
+        return resp.choices[0].message.content or ""
+
+    return llm_call
+
+
 async def extract_template_task(
     ctx: dict,
     task_id: uuid.UUID,
@@ -484,21 +501,8 @@ async def extract_template_task(
             )
             return {"error": msg}
 
-        # Load chat LLM config from admin-configured AIModelConfig — no env fallback.
-        from src.services.ai_model_config_service import get_default_litellm_config
-
-        _llm_cfg = await get_default_litellm_config(db, "chat")
-        # Phase 4 (C1): stream=False qua overrides (thắng config nếu extra_config có 'stream').
-        _llm_kwargs = _llm_cfg.to_kwargs(stream=False)
-
-        # Build an llm_call function using litellm
-        async def llm_call(messages, response_format=None):
-            import litellm
-            kwargs = {"messages": messages, **_llm_kwargs}
-            if response_format:
-                kwargs["response_format"] = response_format
-            resp = await litellm.acompletion(**kwargs)
-            return resp.choices[0].message.content or ""
+        # Phase 4 T5c: chat LLM call qua AIGateway (config admin, no env fallback).
+        llm_call = _build_template_llm_call(db)
 
         try:
             result = await extract_template(
@@ -589,20 +593,8 @@ async def extract_template_draft_task(
             )
             return {"error": msg}
 
-        # LLM config — no env fallback, admin must configure via UI
-        from src.services.ai_model_config_service import get_default_litellm_config
-
-        _llm_cfg = await get_default_litellm_config(db, "chat")
-        # Phase 4 (C1): stream=False qua overrides (thắng config nếu extra_config có 'stream').
-        _llm_kwargs = _llm_cfg.to_kwargs(stream=False)
-
-        async def llm_call(messages, response_format=None):
-            import litellm
-            kwargs = {"messages": messages, **_llm_kwargs}
-            if response_format:
-                kwargs["response_format"] = response_format
-            resp = await litellm.acompletion(**kwargs)
-            return resp.choices[0].message.content or ""
+        # Phase 4 T5c: chat LLM call qua AIGateway (config admin, no env fallback).
+        llm_call = _build_template_llm_call(db)
 
         try:
             result = await extract_template_draft(
