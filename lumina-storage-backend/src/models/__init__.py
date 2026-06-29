@@ -2,6 +2,7 @@ from src.models.base import Base, TimestampMixin
 from src.models.chat import ChatMessage, ChatMessageSource, ChatSession
 from src.models.generator import GeneratorSession
 from src.models.core import AIModelConfig, AuditLog, SystemConfig
+from src.models.extraction import ExtractionProviderConfig
 from src.models.document import (
     Document,
     DocumentChunk,
@@ -66,4 +67,6 @@ __all__ = [
     "AIModelConfig",
     "SystemConfig",
     "AuditLog",
+    # extraction
+    "ExtractionProviderConfig",
 ]

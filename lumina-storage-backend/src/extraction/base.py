@@ -22,3 +22,12 @@ class ExtractionProvider(ABC):
     async def test_connection(self) -> tuple[bool, str]:
         """Kiểm tra provider sẵn sàng (credential/SDK). Trả (ok, message). Default OK."""
         return True, "OK"
+
+    @classmethod
+    def from_config(
+        cls, *, settings, api_key: str | None = None, base_url: str | None = None,
+        options: dict | None = None,
+    ) -> "ExtractionProvider":
+        """Dựng provider từ config (cho selector + test_connection). Provider ngoài override
+        dùng api_key/base_url/options; LocalHybrid dùng settings.gotenberg_url."""
+        raise NotImplementedError(f"{cls.__name__} chưa hỗ trợ from_config")

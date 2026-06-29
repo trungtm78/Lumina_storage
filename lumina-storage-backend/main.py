@@ -21,6 +21,7 @@ from src.api.v1.routes import tasks
 from src.api.v1.routes import documents, chat
 from src.api.v1.routes import folders, google_drive, storage, system
 from src.api.v1.routes import ai_model_config
+from src.api.v1.routes import extraction_provider_config
 from src.api.v1.routes import groups
 from src.api.v1.routes import templates
 from src.api.v1.routes import generator
@@ -120,6 +121,7 @@ def create_app() -> FastAPI:
     app.include_router(google_drive.router, prefix="/api/v1")
     app.include_router(system.router, prefix="/api/v1")
     app.include_router(ai_model_config.router, prefix="/api/v1")
+    app.include_router(extraction_provider_config.router, prefix="/api/v1")
     app.include_router(groups.router, prefix="/api/v1")
     app.include_router(templates.router, prefix="/api/v1")
     app.include_router(generator.router, prefix="/api/v1")

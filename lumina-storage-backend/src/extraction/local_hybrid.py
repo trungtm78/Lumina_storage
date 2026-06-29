@@ -37,3 +37,8 @@ class LocalHybridProvider(ExtractionProvider):
 
     async def test_connection(self) -> tuple[bool, str]:
         return True, "LocalHybrid (nội bộ, luôn khả dụng)"
+
+    @classmethod
+    def from_config(cls, *, settings, api_key=None, base_url=None, options=None):
+        # LocalHybrid không cần credential; dùng gotenberg_url. vlm resolve ở caller (ingest).
+        return cls(gotenberg_url=getattr(settings, "gotenberg_url", ""))
