@@ -140,6 +140,31 @@ class VectorService:
                 updated += len(batch)
         return updated
 
+    async def delete_stale_versions(self, document_id: uuid.UUID, keep_version: str) -> None:
+        """Phase 5a blue/green cleanup: xóa MỌI point của document_id có ingest_version
+        != keep_version. Gọi SAU khi upsert version mới + swap active → vector cũ phục vụ
+        query tới phút chót (không có cửa sổ rỗng); cũng dọn orphan từ run crash trước.
+
+        CẢNH BÁO: caller PHẢI đã ghi `ingest_version=keep_version` vào payload point mới
+        TRƯỚC khi gọi (nếu point mới thiếu ingest_version → must_not không khớp → bị XÓA
+        nhầm). Hiện chỉ state-machine ingest (Task 2e) gọi, đã set version đủ. Không gọi
+        từ luồng cũ delete_by_document."""
+        from qdrant_client.models import FilterSelector
+
+        await self._client.delete(
+            collection_name=self._collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(key="document_id", match=MatchValue(value=str(document_id)))
+                    ],
+                    must_not=[
+                        FieldCondition(key="ingest_version", match=MatchValue(value=keep_version))
+                    ],
+                )
+            ),
+        )
+
     async def delete_by_document(self, document_id: uuid.UUID) -> None:
         from qdrant_client.models import FilterSelector
 
