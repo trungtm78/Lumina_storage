@@ -54,6 +54,9 @@ class _FakeVector:
 
 
 class _FakeExtractor:
+    # Phase 5b: đóng vai LocalHybridProvider (cùng interface extract) — seam ingest giờ qua provider.
+    name = "local_hybrid"
+
     def __init__(self, **kwargs):
         pass
 
@@ -80,7 +83,7 @@ def _patch_all(monkeypatch, extractor=_FakeExtractor):
 
     monkeypatch.setattr(d, "EmbeddingService", _FakeEmbed)
     monkeypatch.setattr(d, "VectorService", _FakeVector)
-    monkeypatch.setattr(d, "TextExtractionService", extractor)
+    monkeypatch.setattr(d, "LocalHybridProvider", extractor)  # seam Phase 5b: provider
     monkeypatch.setattr(d, "get_storage_backend", lambda cfg: _FakeBackend())
     monkeypatch.setattr(
         "src.services.ai_model_config_service.get_default_litellm_config", _fake_get_default

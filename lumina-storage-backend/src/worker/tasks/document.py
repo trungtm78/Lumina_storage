@@ -13,7 +13,7 @@ from src.repositories.document import StorageConfigRepository
 from src.services.embedding_service import EmbeddingService
 from src.services.storage import get_storage_backend
 from src.services.template_service import extract_template, extract_template_draft
-from src.services.text_extraction_service import TextExtractionService
+from src.extraction.local_hybrid import LocalHybridProvider
 from src.services.tokenizer import count_tokens
 from src.services.vector_service import ChunkPoint, VectorService
 
@@ -249,48 +249,27 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             backend = get_storage_backend(storage_config)
             file_bytes = await backend.read(document.file_path)
 
-            # 4. Extract text — separate path for Excel/CSV (RAGFlow style)
+            # 4. Extract text qua ExtractionProvider (Phase 5b). Task 1: LocalHybridProvider
+            # trực tiếp (selector chain ở Task 3). vlm chỉ resolve cho non-excel (giữ hành vi cũ
+            # — Excel-only deployment không cần AI config). LocalHybrid bọc cả 2 path nội bộ.
             _EXCEL_EXTENSIONS = {".xlsx", ".xls", ".csv"}
-
             if document.extension in _EXCEL_EXTENSIONS:
-                # ── Excel/CSV path ───────────────────────────────────────────
-                # Bypass TextExtractionService entirely.
-                # excel_rag_service handles: magic byte detection, fallback chain
-                # (openpyxl → pandas → calamine), merged cells, multi-level headers,
-                # bold hierarchy detection. Returns 1 PageResult per data row.
-                from src.services.excel_rag_service import parse_xlsx_to_page_results
-                pages = parse_xlsx_to_page_results(file_bytes)
-                logger.info(
-                    "[extract] Excel/CSV document_id=%s ext=%s → %d row chunk(s) across %d sheet(s)",
-                    document_id, document.extension, len(pages),
-                    len({p.page_number for p in pages}),
-                )
+                provider = LocalHybridProvider(gotenberg_url=settings.gotenberg_url)
             else:
-                # ── Normal path (PDF, PPTX, DOCX, images, ...) ──────────────
                 from src.services.ai_model_config_service import get_default_litellm_config
 
-                # Phase 4 T2: dùng purpose 'vlm' (fallback 'chat' nếu admin chưa cấu hình vlm
-                # — get_default_litellm_config xử lý no-raise). Cho phép cấu hình model + max_tokens
-                # riêng cho VLM (vd multimodal gpt-4o với max_tokens lớn cho trang dày).
+                # Phase 4 T2: purpose 'vlm' (fallback 'chat' no-raise) — model + max_tokens riêng VLM.
                 vlm_cfg = await get_default_litellm_config(db, "vlm")
-                vlm_model = vlm_cfg.model
-                vlm_kwargs: dict = {k: v for k, v in vlm_cfg.to_kwargs().items() if k != "model"}
-
-                extractor = TextExtractionService(
+                provider = LocalHybridProvider(
                     gotenberg_url=settings.gotenberg_url,
-                    vlm_model=vlm_model,
-                    vlm_kwargs=vlm_kwargs,
+                    vlm_model=vlm_cfg.model,
+                    vlm_kwargs={k: v for k, v in vlm_cfg.to_kwargs().items() if k != "model"},
                 )
-                pages = await extractor.extract(file_bytes, document.mime_type, document.extension)
-                logger.info(
-                    "[extract] document_id=%s mime=%s ext=%s → %d page(s)",
-                    document_id, document.mime_type, document.extension, len(pages),
-                )
-                for p in pages:
-                    logger.info(
-                        "[extract]   page_number=%s  chars=%d\n%s",
-                        p.page_number, len(p.text), p.text,
-                    )
+            pages = await provider.extract(file_bytes, document.mime_type, document.extension)
+            logger.info(
+                "[extract] document_id=%s provider=%s mime=%s ext=%s → %d page(s)",
+                document_id, provider.name, document.mime_type, document.extension, len(pages),
+            )
 
             if not pages:
                 # Phase 5a R3: blue/green → extract rỗng = FAILED, KHÔNG hủy bản tốt cũ
