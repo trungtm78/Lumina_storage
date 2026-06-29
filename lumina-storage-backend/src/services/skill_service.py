@@ -128,7 +128,14 @@ class SkillContext:
         return new_doc.id
 
     async def llm_call(self, messages: list[dict], response_format: dict | None = None) -> str:
-        """Call LLM from within a skill script. Uses user's selected model if available."""
+        """Call LLM from within a skill script. Uses user's selected model if available.
+
+        Phase 4 T5d — INFRA-EXCEPTION CỐ Ý: KHÔNG qua AIGateway. Nhánh override cấp
+        model + api_key/base/version RIÊNG (user tự chọn), bỏ qua DB-default config mà
+        gateway bắt buộc resolve qua get_default_litellm_config. Override còn dùng được
+        cả khi admin CHƯA cấu hình default chat → route qua gateway sẽ thêm get_default
+        (có thể raise) = regression. Giữ litellm trực tiếp ở đây là đúng (cùng nhóm
+        infra với text_extraction VLM)."""
         import litellm
 
         # Use override model if it has its own api_key, otherwise look up the
