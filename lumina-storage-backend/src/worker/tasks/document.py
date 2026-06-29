@@ -14,6 +14,7 @@ from src.services.embedding_service import EmbeddingService
 from src.services.storage import get_storage_backend
 from src.services.template_service import extract_template, extract_template_draft
 from src.services.text_extraction_service import TextExtractionService
+from src.services.tokenizer import count_tokens
 from src.services.vector_service import ChunkPoint, VectorService
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,10 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                 raise _IngestFailed("Document not found")
 
             settings = get_settings()
+            # Phase 5a R1/R10: blue/green re-ingest (flag). V_new = uuid cho lần ingest này;
+            # 'legacy' khi tắt flag (luồng cũ).
+            blue_green = settings.extraction_blue_green
+            ingest_version = str(uuid.uuid4()) if blue_green else "legacy"
 
             embedding_svc: EmbeddingService = await EmbeddingService.from_db_default(db)
             vector_svc: VectorService = VectorService(settings)
@@ -288,8 +293,11 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                     )
 
             if not pages:
-                # page_count=0 ghi ở nhánh except _IngestSkip (session riêng) vì raise dưới
-                # đây sẽ rollback business — không set trên session business (sẽ mất).
+                # Phase 5a R3: blue/green → extract rỗng = FAILED, KHÔNG hủy bản tốt cũ
+                # (chưa mutate gì → uow rollback giữ nguyên active/chunk/page_count cũ). Luồng
+                # cũ (flag off) giữ hành vi skip+page_count=0.
+                if blue_green:
+                    raise _IngestFailed("Trích xuất không ra nội dung")
                 raise _IngestSkip({"page_count": 0, "chunk_count": 0, "skipped": True})
 
             # Phase 5a T2 (codex): chuẩn hóa NFC TẤT CẢ page ở MỘT điểm — gồm Excel/CSV
@@ -316,12 +324,14 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                 {"id": str(document_id)},
             )
 
-            # 7. Delete old chunks + vectors
-            await vector_svc.delete_by_document(document_id)
-            await db.execute(
-                delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
-            )
-            await db.flush()
+            # 7. Phase 5a R1: blue/green KHÔNG xóa cũ trước (giữ chunk+vector cũ phục vụ query
+            # tới khi swap; cleanup SAU commit). Luồng cũ (flag off): delete-trước-upsert.
+            if not blue_green:
+                await vector_svc.delete_by_document(document_id)
+                await db.execute(
+                    delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+                )
+                await db.flush()
 
             # 8. Chunking strategy:
             #    - Excel/CSV → already 1 row per PageResult, no splitting needed
@@ -392,6 +402,8 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                         chunk_index=idx,
                         content=lc_chunk.page_content,
                         page_number=page_num,
+                        ingest_version=ingest_version,  # Phase 5a R1: gắn version blue/green
+                        token_count=count_tokens(lc_chunk.page_content),  # T5: token THẬT
                     )
                     db.add(chunk)
                     chunk_records.append(chunk)
@@ -416,11 +428,23 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
                                 "chunk_index": chunk.chunk_index,
                                 "page_number": chunk.page_number,
                                 "content": chunk.content,
+                                "ingest_version": ingest_version,  # Phase 5a R1 blue/green
                             },
                         )
                     )
                     chunk.qdrant_point_id = point_id
                 await vector_svc.upsert_chunks(points)
+
+            # 11b. Phase 5a A1: FTS chunk-level — populate search_vector cho chunk version mới
+            # (NFC ở extraction + unaccent ở đây cho match không dấu).
+            await db.execute(
+                text(
+                    "UPDATE documents_documentchunk "
+                    "SET search_vector = to_tsvector('simple', unaccent(content)) "
+                    "WHERE document_id = :id AND ingest_version = :v"
+                ),
+                {"id": str(document_id), "v": ingest_version},
+            )
 
             # 12. Update document metadata
             # Excel: page_number = sheet index → count distinct sheets, not rows
@@ -429,9 +453,34 @@ async def ingest_document_task(ctx: dict, task_id: uuid.UUID, document_id: uuid.
             else:
                 document.page_count = len(pages)
 
+            # 12b. Phase 5a R1: SWAP active_ingest_version = ingest_version (CẢ legacy path để
+            # active LUÔN khớp version chunk vừa ghi — codex P2). DB commit (thoát async with) =
+            # điểm swap NGUYÊN TỬ — reads lọc active (Task 3/R2) từ đây thấy version mới.
+            document.active_ingest_version = ingest_version
+
             # 13. Business xong — set result (status='success' ghi SAU khi uow commit).
             result = {"page_count": len(pages), "chunk_count": len(final_chunks)}
         # uow_context commit business ở đây (thoát async with không lỗi).
+
+        # 14. Phase 5a R1: SAU business commit (swap xong) → cleanup version cũ (best-effort,
+        # KHÔNG ảnh hưởng correctness vì reads lọc active). Qdrant TRƯỚC DB (codex): cleanup lỗi
+        # giữa chừng thì để orphan DB-chunk (vô hại, lọc active) hơn orphan vector (chunk_id đã
+        # xóa → citation FK fail).
+        if blue_green:
+            try:
+                await vector_svc.delete_stale_versions(document_id, ingest_version)
+                # session riêng cleanup (ngoài business uow đã commit; best-effort).
+                async with session_factory() as cs:
+                    await cs.execute(
+                        delete(DocumentChunk).where(
+                            DocumentChunk.document_id == document_id,
+                            DocumentChunk.ingest_version != ingest_version,
+                        )
+                    )
+                    # commit session riêng cleanup (Phase 5a R1, ngoài business uow đã commit).
+                    await cs.commit()
+            except Exception as ce:
+                logger.warning("[blue/green] cleanup stale version failed (non-fatal): %s", ce)
     except _IngestSkip as skip:
         # Document không có page → success(skipped). Business đã rollback, nên persist
         # page_count=0 ở SESSION RIÊNG (re-ingest từ N page → 0 page phải reset đúng).

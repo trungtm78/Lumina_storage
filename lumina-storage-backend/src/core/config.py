@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # cùng pipeline citation, sau khi golden (tests/test_golden_chat_phase4.py) đạt.
     chat_unified_stream: bool = False
 
+    # Phase 5a R10 — blue/green re-ingest. True (default): upsert version mới → swap
+    # active_ingest_version tại DB commit → cleanup version cũ (không cửa sổ rỗng, crash/empty
+    # giữ bản tốt cũ). False: rollback về luồng cũ delete-trước-upsert (khẩn cấp, không cần revert).
+    extraction_blue_green: bool = True
+
     # Lumina SSO
     lumina_sso_service_url: str = ""  # URL của lumina-sso-service, VD: http://localhost:3100
 
