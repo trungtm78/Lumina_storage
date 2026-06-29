@@ -8,6 +8,7 @@ from src.services.ai_model_config_service import (
     LiteLLMConfig,
     get_default_litellm_config,
 )
+from src.services.tokenizer import truncate_to_token_limit
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,9 +16,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BATCH_SIZE = 16          # số texts mỗi request
-_MAX_CONCURRENT = 1      # số batch chạy song song tối đa (tránh rate limit)
+_MAX_CONCURRENT = 3      # Phase 5a T7: 1→3 batch song song (giữ rate-limit retry bên dưới)
 _MAX_RETRIES = 5
 _RETRY_BASE_DELAY = 15.0  # seconds
+# Phase 5a T6: ngưỡng TOKEN (thay truncate 12000 KÝ TỰ mù). Cao mặc định để chunk thường
+# (~1800 char) KHÔNG bị cắt; override per-model qua AIModelConfig extra_config embed_max_tokens.
+_DEFAULT_MAX_TOKENS_PER_TEXT = 8000
 
 
 class EmbeddingService:
@@ -29,6 +33,10 @@ class EmbeddingService:
         self.api_key = config.api_key
         self.api_base = config.api_base
         self.api_version = config.api_version
+        # T6: ngưỡng token. config.embed_max_tokens đã validate (số nguyên dương) ở
+        # get_default_litellm_config; None/không hợp lệ → default. (codex P2: tránh crash/0.)
+        emt = getattr(config, "embed_max_tokens", None)
+        self._max_tokens = emt if isinstance(emt, int) and emt > 0 else _DEFAULT_MAX_TOKENS_PER_TEXT
 
     @classmethod
     async def from_db_default(cls, db: "AsyncSession") -> "EmbeddingService":
@@ -55,14 +63,13 @@ class EmbeddingService:
         else:
             return await self._embed_single_request(texts)
 
-    # Table số có token density ~0.54/char, dùng 12000 chars (~6480 tokens) để an toàn
-    _MAX_CHARS_PER_TEXT = 12000
-
     async def _embed_single_request(self, texts: list[str]) -> list[list[float]]:
-        """1 request với retry backoff cho RateLimitError. Truncate nếu text quá dài."""
-        truncated = [t[: self._MAX_CHARS_PER_TEXT] if len(t) > self._MAX_CHARS_PER_TEXT else t for t in texts]
+        """1 request với retry backoff cho RateLimitError. Phase 5a T6: cắt theo TOKEN thật
+        (truncate_to_token_limit) thay truncate ký tự mù — chunk thường (~1800 char) không bị
+        cắt; chỉ text vượt _max_tokens (vd bảng dày) mới cắt, đúng theo token model."""
+        truncated = [truncate_to_token_limit(t, self._max_tokens, model=self.model) for t in texts]
         if any(len(t) < len(o) for t, o in zip(truncated, texts)):
-            logger.warning("[embedding] truncated %d text(s) to %d chars", sum(1 for t, o in zip(truncated, texts) if len(t) < len(o)), self._MAX_CHARS_PER_TEXT)
+            logger.warning("[embedding] truncated %d text(s) to %d tokens", sum(1 for t, o in zip(truncated, texts) if len(t) < len(o)), self._max_tokens)
         delay = _RETRY_BASE_DELAY
         for attempt in range(_MAX_RETRIES):
             try:

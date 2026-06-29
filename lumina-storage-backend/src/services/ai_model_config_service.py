@@ -18,6 +18,11 @@ _LITELLM_PREFIXES: dict[str, str] = {
 }
 
 
+# Phase 5a T6: key trong extra_config CHỈ dùng nội bộ service (KHÔNG phải kwarg provider) →
+# phải lọc khỏi mọi đường splat vào litellm (to_kwargs + test-connection) tránh unknown-kwarg.
+_SERVICE_ONLY_KEYS = {"embed_max_tokens"}
+
+
 def build_litellm_model(provider: str, model_name: str) -> str:
     """Return the correct LiteLLM model string for the given provider."""
     prefix = _LITELLM_PREFIXES.get(provider, "")
@@ -41,8 +46,10 @@ class LiteLLMConfig:
     api_version: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    # Phase 5a T6: ngưỡng token cắt input embedding (service-local, KHÔNG splat vào provider).
+    embed_max_tokens: int | None = None
     # Param phụ đọc từ extra_config (top_p/seed/response_format...). Không gồm các
-    # field đã model hóa ở trên (api_version/max_tokens/temperature).
+    # field đã model hóa ở trên (api_version/max_tokens/temperature/embed_max_tokens).
     extra: dict = field(default_factory=dict)
 
     def to_kwargs(self, **overrides) -> dict:
@@ -98,9 +105,15 @@ async def get_default_litellm_config(
             f"Admin must add one in the AI Model Config admin page."
         )
     extra_cfg = cfg.extra_config or {}
-    _KNOWN = {"api_version", "max_tokens", "temperature"}
+    _KNOWN = {"api_version", "max_tokens", "temperature"} | _SERVICE_ONLY_KEYS
     max_tokens = extra_cfg.get("max_tokens")
     temperature = extra_cfg.get("temperature")
+    # T6: validate embed_max_tokens (số nguyên dương; null/0/âm/non-int → None → default ở service).
+    _emt = extra_cfg.get("embed_max_tokens")
+    embed_max_tokens = (
+        int(_emt) if isinstance(_emt, (int, float)) and not isinstance(_emt, bool) and int(_emt) > 0
+        else None
+    )
     if fell_back:
         # /codex T2 P2: param SINH (max_tokens/temperature) của chat config KHÔNG phù hợp
         # VLM — chat max_tokens thấp (vd 2048) sẽ làm VLM cắt cụt. Bỏ để lớp tiêu thụ VLM
@@ -114,6 +127,7 @@ async def get_default_litellm_config(
         api_version=extra_cfg.get("api_version"),
         max_tokens=max_tokens,
         temperature=temperature,
+        embed_max_tokens=embed_max_tokens,
         extra={k: v for k, v in extra_cfg.items() if k not in _KNOWN},
     )
 
@@ -214,7 +228,7 @@ class AIModelConfigService:
                 if data.base_url:
                     kwargs["api_base"] = data.base_url
                 if data.extra_config:
-                    kwargs.update(data.extra_config)
+                    kwargs.update({k: v for k, v in data.extra_config.items() if k not in _SERVICE_ONLY_KEYS})
 
                 response = await litellm.aembedding(
                     model=model_str,
@@ -243,7 +257,7 @@ class AIModelConfigService:
                 if data.base_url:
                     kwargs["api_base"] = data.base_url
                 if data.extra_config:
-                    kwargs.update(data.extra_config)
+                    kwargs.update({k: v for k, v in data.extra_config.items() if k not in _SERVICE_ONLY_KEYS})
 
                 llm = ChatLiteLLM(model=model_str, **kwargs)
                 response = await llm.ainvoke([HumanMessage(content="Say 'ok' in one word")])
