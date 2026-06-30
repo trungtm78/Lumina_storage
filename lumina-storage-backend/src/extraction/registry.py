@@ -17,3 +17,8 @@ def get_provider_class(name: str) -> type[ExtractionProvider] | None:
 
 
 register(LocalHybridProvider.name, LocalHybridProvider)
+
+# Provider ngoài — Gemini qua litellm (luôn khả dụng, không cần SDK riêng).
+from src.extraction.providers.gemini import GeminiProvider  # noqa: E402
+
+register(GeminiProvider.name, GeminiProvider)
