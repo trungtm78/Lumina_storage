@@ -1,7 +1,7 @@
 """Phase 4 — AI Gateway: điểm vào DUY NHẤT cho LLM / Embedding / VLM.
 
-Thin facade delegate sang service/litellm đã có (LLMService, EmbeddingService,
-litellm, build_model) + gắn tracing hook ở MỘT chỗ. KHÔNG nhồi logic (tránh god-class).
+Thin facade delegate sang service/litellm đã có (EmbeddingService, litellm,
+build_model) + gắn tracing hook ở MỘT chỗ. KHÔNG nhồi logic (tránh god-class).
 """
 from src.ai.gateway import AIGateway
 
