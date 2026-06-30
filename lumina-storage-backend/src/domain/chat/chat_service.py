@@ -269,6 +269,32 @@ class ChatService:
         model_str = build_litellm_model(config.provider, config.model_name)
         return ChatLiteLLM(model=model_str, **kwargs)
 
+    async def _nullify_missing_chunk_ids(self, sources: list[ChatMessageSource]) -> None:
+        """Degrade chunk_id=NULL cho source trỏ chunk đã không còn (ARCH-P2).
+
+        Re-ingest blue/green xóa chunk non-active có thể xảy ra GIỮA retrieval và commit →
+        chunk_id trỏ chunk đã mất → FK violation lúc commit → crash stream. Validate chunk còn
+        sống NGAY trước insert; mất thì set NULL (FK nullable, ondelete SET NULL). Thu hẹp cửa
+        sổ race từ cả stream LLM (giây) xuống sub-ms giữa validate và commit.
+        """
+        from src.shared.models.document import DocumentChunk
+
+        chunk_ids = {s.chunk_id for s in sources if s.chunk_id is not None}
+        if not chunk_ids:
+            return
+        existing = set(
+            (
+                await self.db.execute(
+                    select(DocumentChunk.id).where(DocumentChunk.id.in_(chunk_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for s in sources:
+            if s.chunk_id is not None and s.chunk_id not in existing:
+                s.chunk_id = None
+
     # ── Agent mode ────────────────────────────────────────────────────
 
     async def _save_user_message(
@@ -487,7 +513,11 @@ class ChatService:
         # 10. Save sources from collector (rag_search / parse_document _sources).
         # Phase 4 T6: collector.search_results giờ MỘT shape (Citation dict) sau khi xóa
         # query_vector_db → citations_to_sources (dict-only + bỏ entry thiếu document_id).
-        for source in citations_to_sources(collector.search_results, assistant_msg.id):
+        sources_to_save = citations_to_sources(collector.search_results, assistant_msg.id)
+        # ARCH-P2: re-ingest blue/green có thể đã xóa chunk (non-active) GIỮA retrieval và commit
+        # → chunk_id trỏ chunk đã mất → FK violation lúc commit → crash stream. Degrade NULL.
+        await self._nullify_missing_chunk_ids(sources_to_save)
+        for source in sources_to_save:
             self.db.add(source)
 
         # Save ID before expire_all to avoid lazy-load in async context
