@@ -29,6 +29,7 @@ from src.services.agent import (
 )
 from src.services.ai_model_config_service import build_litellm_model
 from src.services.chat_permission_service import ChatPermissionService
+from src.services.chat_title_service import generate_title_background
 from src.services.document_permission import DocumentPermissionService
 from src.services.embedding_service import EmbeddingService
 from src.services.skill_service import SkillService
@@ -48,45 +49,7 @@ Hướng dẫn trả lời:
 - Nếu context không đủ để trả lời, hãy nói rõ."""
 
 
-async def _generate_title_background(
-    session_id: uuid.UUID,
-    user_msg: str,
-    assistant_msg: str,
-    settings: Settings,
-) -> None:
-    """Generate and save session title in background — uses its own db session
-    so the caller's session can be closed without blocking."""
-    from src.core.database import AsyncSessionLocal
-
-    try:
-        async with AsyncSessionLocal() as db:
-            session = await db.get(ChatSession, session_id)
-            if not session or session.title:
-                return
-            skill_svc = SkillService(settings)
-            model_str, api_key, api_base, _api_version, _extra = (
-                await skill_svc.resolve_model(db, settings, model_id=None)
-            )
-            title_llm = ChatLiteLLM(
-                model=model_str,
-                api_key=api_key,
-                api_base=api_base,
-                streaming=False,
-                max_tokens=20,
-            )
-            prompt = (
-                f"Generate a short title (max 8 words, no quotes, no punctuation) "
-                f"for this conversation:\nUser: {user_msg[:300]}\nAssistant: {assistant_msg[:300]}"
-            )
-            response = await title_llm.ainvoke([HumanMessage(content=prompt)])
-            title = response.content.strip().strip("\"'")
-            session.title = title[:100] if title else user_msg[:50]
-            # Phase 3: background title task chạy ở SESSION RIÊNG → commit CỐ Ý.
-            await db.commit()
-    except Exception:
-        logger.debug("Background title generation failed", exc_info=True)
-
-
+# Phase 8 W2.2: _generate_title_background chuyển sang src/services/chat_title_service.py.
 # Phase 7: citation builders chuyển sang src/services/citation_service.py (tách god-service).
 from src.services.citation_service import citations_to_sources  # noqa: E402
 
@@ -301,29 +264,6 @@ class ChatService:
 
         model_str = build_litellm_model(config.provider, config.model_name)
         return ChatLiteLLM(model=model_str, **kwargs)
-
-    async def _generate_title(self, user_msg: str, assistant_msg: str) -> str:
-        try:
-            prompt = (
-                f"Generate a short title (max 8 words, no quotes, no punctuation) "
-                f"for this conversation:\nUser: {user_msg[:300]}\nAssistant: {assistant_msg[:300]}"
-            )
-            skill_svc = SkillService(self.settings)
-            model_str, api_key, api_base, _api_version, _extra = await skill_svc.resolve_model(
-                self.db, self.settings, model_id=None
-            )
-            title_llm = ChatLiteLLM(
-                model=model_str,
-                api_key=api_key,
-                api_base=api_base,
-                streaming=False,
-                max_tokens=20,
-            )
-            response = await title_llm.ainvoke([HumanMessage(content=prompt)])
-            title = response.content.strip().strip('"\'')
-            return title[:100] if title else user_msg[:50]
-        except Exception:
-            return user_msg[:50]
 
     # ── Agent mode ────────────────────────────────────────────────────
 
@@ -587,5 +527,5 @@ class ChatService:
         session = await self.db.get(ChatSession, session_id)
         if session and not session.title:
             asyncio.create_task(
-                _generate_title_background(session_id, user_message, assistant_content, self.settings)
+                generate_title_background(session_id, user_message, assistant_content, self.settings)
             )
