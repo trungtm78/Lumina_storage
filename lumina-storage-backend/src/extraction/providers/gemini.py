@@ -7,21 +7,11 @@ parse thành list[PageResult]. Credential = api_key của config (không qua DB 
 import base64
 
 from src.extraction.base import ExtractionProvider
+from src.extraction.providers._mime import canonical_mime
 from src.services.text_extraction_service import PageResult
 
 _PAGE_DELIM = "---PAGE-BREAK---"
 _DEFAULT_MODEL = "gemini-2.0-flash"
-# Canonicalize MIME từ extension khi mime rỗng/generic (vd application/octet-stream từ import).
-_EXT_MIME = {
-    ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".tiff": "image/tiff", ".bmp": "image/bmp",
-}
-
-
-def _canonical_mime(mime_type: str, extension: str) -> str:
-    if mime_type and mime_type != "application/octet-stream":
-        return mime_type
-    return _EXT_MIME.get((extension or "").lower(), mime_type or "application/pdf")
 _PROMPT = (
     "Trích xuất TOÀN BỘ nội dung tài liệu thành markdown, giữ cấu trúc (heading, bảng, danh "
     f"sách). Phân tách MỖI trang bằng đúng dòng '{_PAGE_DELIM}'. Chỉ trả nội dung, không giải thích."
@@ -55,7 +45,7 @@ class GeminiProvider(ExtractionProvider):
         import litellm
 
         b64 = base64.b64encode(file_bytes).decode()
-        mime = _canonical_mime(mime_type, extension)
+        mime = canonical_mime(mime_type, extension)
         data_url = f"data:{mime};base64,{b64}"
         # Ảnh → image_url; PDF/tài liệu → litellm 'file' content (đúng shape document input).
         if mime.startswith("image/"):
