@@ -440,9 +440,8 @@ async def get_template_usage(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    from src.repositories.generator import GeneratorSessionRepository
-    repo = GeneratorSessionRepository(db)
-    count = await repo.count_draft_by_template(document_id)
+    from src.services.generator_service import GeneratorService
+    count = await GeneratorService(db).count_drafts_by_template(document_id)
     return {"draft_session_count": count}
 
 

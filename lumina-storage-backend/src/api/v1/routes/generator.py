@@ -1211,10 +1211,7 @@ async def _execute_generate(
 # ─── Generator Sessions ────────────────────────────────────────────────────────
 
 from src.models.generator import GeneratorSession
-from src.repositories.generator import (
-    GeneratorSessionRepository,
-    GeneratorSessionVersionRepository,
-)
+from src.services.generator_service import GeneratorService
 from src.schemas.generator import (
     AiReviseApplyRequest,
     AiReviseApplyResponse,
@@ -1571,8 +1568,8 @@ async def create_session(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    repo = GeneratorSessionRepository(db)
-    session = await repo.create({
+    svc = GeneratorService(db)
+    session = await svc.create_session({
         "user_id": current_user.id,
         "template_id": body.template_id,
         "doc_type": body.doc_type,
@@ -1594,8 +1591,8 @@ async def list_sessions(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    repo = GeneratorSessionRepository(db)
-    items, total = await repo.list_for_user(
+    svc = GeneratorService(db)
+    items, total = await svc.list_sessions_for_user(
         user_id=current_user.id,
         status=status,
         limit=limit,
@@ -1634,8 +1631,8 @@ async def update_session(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
@@ -1650,7 +1647,7 @@ async def update_session(
         update_data["edited_html"] = body.edited_html
 
     if update_data:
-        session = await repo.update(session_id, update_data)
+        session = await svc.update_session(session_id, update_data)
 
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
@@ -1664,8 +1661,8 @@ async def generate_from_session(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
     _has_edit = bool(body.version_id or body.edited_html or session.edited_html)
@@ -1680,8 +1677,7 @@ async def generate_from_session(
     edited_html = None
     edited_fv = session.field_values or {}
     if body.version_id:
-        ver_repo = GeneratorSessionVersionRepository(db)
-        ver = await ver_repo.get_by_id_for_session(body.version_id, session_id)
+        ver = await svc.get_version_for_session(body.version_id, session_id)
         if ver is None:
             raise HTTPException(404, "Version not found")
         edited_html = ver.edited_html
@@ -1786,7 +1782,7 @@ async def generate_from_session(
             db.add(doc)
             await db.flush()
             await db.refresh(doc)
-            session = await repo.update(session_id, {
+            session = await svc.update_session(session_id, {
                 "status": "completed",
                 "document_id": doc.id,
                 "folder_id": target_folder_id,
@@ -1797,7 +1793,7 @@ async def generate_from_session(
             # phải bền qua rollback của boundary. KHÔNG gỡ.
             await db.commit()
         except HTTPException:
-            await repo.update(session_id, {"status": "failed", "error_message": "Manual-edit generation failed"})
+            await svc.update_session(session_id, {"status": "failed", "error_message": "Manual-edit generation failed"})
             await db.commit()
             raise
         return GeneratorSessionResponse.model_validate(session)
@@ -1875,7 +1871,7 @@ async def generate_from_session(
             except Exception as e:
                 raise HTTPException(502, f"PDF conversion error: {e}") from e
 
-        session = await repo.update(session_id, {
+        session = await svc.update_session(session_id, {
             "status": "completed",
             "document_id": final_document_id,
             "folder_id": target_folder_id,
@@ -1884,7 +1880,7 @@ async def generate_from_session(
         # commit TRƯỚC `raise` → phải bền qua rollback của boundary. KHÔNG gỡ.
         await db.commit()
     except HTTPException:
-        await repo.update(session_id, {"status": "failed", "error_message": "Generation failed"})
+        await svc.update_session(session_id, {"status": "failed", "error_message": "Generation failed"})
         await db.commit()
         raise
 
@@ -1897,11 +1893,11 @@ async def delete_session(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
-    await repo.delete(session_id)
+    await svc.delete_session(session_id)
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
 
@@ -1918,16 +1914,15 @@ async def create_session_version(
     """Lưu một bản chỉnh sửa tay → tạo version + cập nhật con trỏ edited_html của session."""
     from datetime import datetime, timezone
 
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
-    ver_repo = GeneratorSessionVersionRepository(db)
-    version_no = await ver_repo.next_version_no(session_id)
+    version_no = await svc.next_version_no(session_id)
     label = body.label or f"V{version_no} — {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')}"
 
-    version = await ver_repo.create({
+    version = await svc.create_version({
         "session_id": session_id,
         "version_no": version_no,
         "label": label,
@@ -1938,7 +1933,7 @@ async def create_session_version(
     update: dict = {"edited_html": body.edited_html}
     if body.field_values:
         update["field_values"] = body.field_values
-    await repo.update(session_id, update)
+    await svc.update_session(session_id, update)
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
     await db.refresh(version)
@@ -1953,13 +1948,12 @@ async def list_session_versions(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
-    ver_repo = GeneratorSessionVersionRepository(db)
-    items, total = await ver_repo.list_for_session(session_id, limit=limit, offset=offset)
+    items, total = await svc.list_versions_for_session(session_id, limit=limit, offset=offset)
     return GeneratorSessionVersionListResponse(
         items=[GeneratorSessionVersionResponse.model_validate(v) for v in items],
         total=total,
@@ -1975,18 +1969,17 @@ async def update_session_version(
     db: AsyncSession = Depends(get_db),
 ):
     """Đổi tên (label) một version."""
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
-    ver_repo = GeneratorSessionVersionRepository(db)
-    version = await ver_repo.get_by_id_for_session(version_id, session_id)
+    version = await svc.get_version_for_session(version_id, session_id)
     if version is None:
         raise HTTPException(404, "Version not found")
 
     if body.label is not None:
-        version = await ver_repo.update(version_id, {"label": body.label})
+        version = await svc.update_version(version_id, {"label": body.label})
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
     await db.refresh(version)
@@ -2001,16 +1994,15 @@ async def delete_session_version(
     db: AsyncSession = Depends(get_db),
 ):
     """Xoá một version."""
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
-    ver_repo = GeneratorSessionVersionRepository(db)
-    version = await ver_repo.get_by_id_for_session(version_id, session_id)
+    version = await svc.get_version_for_session(version_id, session_id)
     if version is None:
         raise HTTPException(404, "Version not found")
-    await ver_repo.delete(version_id)
+    await svc.delete_version(version_id)
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
 
@@ -2125,8 +2117,8 @@ async def ai_revise(
     nguyên thẻ + sanitize/guard (Tuyến 2). Không tự lưu version — FE quyết định
     duyệt rồi gọi /apply + tạo version.
     """
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
@@ -2177,8 +2169,8 @@ async def ai_revise_apply(
     Dùng chung lõi với /ai-revise (apply + sanitize + guard). FE gọi sau khi
     accept một phần / toàn bộ, rồi tự tạo version từ kết quả.
     """
-    repo = GeneratorSessionRepository(db)
-    session = await repo.get_by_id_for_user(session_id, current_user.id)
+    svc = GeneratorService(db)
+    session = await svc.get_session_for_user(session_id, current_user.id)
     if session is None:
         raise HTTPException(404, "Session not found")
 
