@@ -8,6 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser
 from src.core.database import get_db
+from src.domain.generator._template_guard import (
+    assert_template_permission,
+    load_template_checked,
+)
 from src.models.document import Document
 from src.schemas.template import (
     PaginatedTemplatesResponse,
@@ -114,6 +118,9 @@ async def get_template(
     if not doc or doc.deleted_at is not None:
         raise HTTPException(404, "Template not found")
 
+    # CHỐNG IDOR (review SEC-P1 + /codex): chỉ user có quyền trên doc yêu cầu mới đọc được.
+    await assert_template_permission(db, current_user, doc.id)
+
     # Normal case: already a template document
     if doc.source_type == "template":
         return _build_template_response(doc)
@@ -129,10 +136,13 @@ async def get_template(
     if meta.get("template_id"):
         try:
             t = await db.get(Document, uuid.UUID(str(meta["template_id"])))
-            if t and t.source_type == "template" and t.deleted_at is None:
-                return _build_template_response(t)
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            t = None
+        if t and t.source_type == "template" and t.deleted_at is None:
+            # CHỐNG IDOR (/codex): template được resolve có thể KHÁC chủ với source doc
+            # (source doc có thể share cho user) → phải check quyền trên CHÍNH template trả về.
+            await assert_template_permission(db, current_user, t.id)
+            return _build_template_response(t)
 
     # Fallback: search for the template created from this source document.
     # Handles workers running old code that didn't write template_id back.
@@ -149,6 +159,7 @@ async def get_template(
     result = await db.execute(stmt)
     found = result.scalar_one_or_none()
     if found:
+        await assert_template_permission(db, current_user, found.id)  # IDOR: check template resolve
         return _build_template_response(found)
 
     # Not created yet — return the source doc so frontend sees current status
@@ -163,10 +174,8 @@ async def update_template(
     db: AsyncSession = Depends(get_db),
 ):
     """Update template description."""
-    doc = await db.get(Document, template_id)
-    if not doc or doc.source_type != "template" or doc.deleted_at is not None:
-        from fastapi import HTTPException
-        raise HTTPException(404, "Template not found")
+    # CHỐNG IDOR (review SEC-P1 + /codex): write template cần quyền 'editor'. Denial → 404.
+    doc = await load_template_checked(db, current_user, template_id, required="editor")
 
     if body.description is not None:
         doc.description = body.description
@@ -203,10 +212,8 @@ async def update_template_fields(
     from src.models.storage import StorageConfig
     from src.services.storage import get_storage_backend
 
-    doc = await db.get(Document, template_id)
-    if not doc or doc.source_type != "template" or doc.deleted_at is not None:
-        from fastapi import HTTPException
-        raise HTTPException(404, "Template not found")
+    # CHỐNG IDOR (review SEC-P1 + /codex): write template cần quyền 'editor'. Denial → 404.
+    doc = await load_template_checked(db, current_user, template_id, required="editor")
 
     meta = doc.source_metadata or {}
     old_fields = meta.get("template_fields", [])
@@ -309,10 +316,8 @@ async def upload_template_file(
     from src.models.storage import StorageConfig
     from src.services.storage import get_storage_backend
 
-    doc = await db.get(Document, template_id)
-    if not doc or doc.source_type != "template" or doc.deleted_at is not None:
-        from fastapi import HTTPException
-        raise HTTPException(404, "Template not found")
+    # CHỐNG IDOR (review SEC-P1 + /codex): write template cần quyền 'editor'. Denial → 404.
+    doc = await load_template_checked(db, current_user, template_id, required="editor")
 
     # Read raw body (binary DOCX)
     body = await request.body()
@@ -397,10 +402,8 @@ async def rescan_template_fields(
     from src.models.storage import StorageConfig
     from src.services.storage import get_storage_backend
 
-    doc = await db.get(Document, template_id)
-    if not doc or doc.source_type != "template" or doc.deleted_at is not None:
-        from fastapi import HTTPException
-        raise HTTPException(404, "Template not found")
+    # CHỐNG IDOR (review SEC-P1 + /codex): write template cần quyền 'editor'. Denial → 404.
+    doc = await load_template_checked(db, current_user, template_id, required="editor")
 
     storage_cfg = await db.get(StorageConfig, doc.storage_config_id)
     backend = get_storage_backend(storage_cfg)

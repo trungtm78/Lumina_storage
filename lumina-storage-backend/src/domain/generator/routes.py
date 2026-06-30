@@ -20,6 +20,7 @@ from src.api.deps import CurrentUser
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.template_presets import TEMPLATE_FIELD_PRESETS
+from src.domain.generator._template_guard import load_template_checked
 from src.models.document import Document
 from src.services.reference_loader import (
     format_reference_block,
@@ -141,9 +142,7 @@ async def render_pdf_preview(
     from docx import Document as DocxDocument
     from src.models.storage import StorageConfig
 
-    template_doc = await db.get(Document, uuid.UUID(body.template_id))
-    if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
-        raise HTTPException(404, "Template not found")
+    template_doc = await load_template_checked(db, current_user, uuid.UUID(body.template_id))
 
     storage_cfg = await db.get(StorageConfig, template_doc.storage_config_id)
     if not storage_cfg:
@@ -387,9 +386,7 @@ async def map_columns(
     instruction: str = Form(""),
     file: UploadFile = File(...),
 ):
-    template_doc = await db.get(Document, uuid.UUID(template_id))
-    if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
-        raise HTTPException(404, "Template not found")
+    template_doc = await load_template_checked(db, current_user, uuid.UUID(template_id))
 
     meta = template_doc.source_metadata or {}
     placeholders = [f["placeholder"] for f in meta.get("template_fields", [])]
@@ -448,9 +445,7 @@ async def batch_generate_documents(
     from docx import Document as DocxDocument
     from src.models.storage import StorageConfig
 
-    template_doc = await db.get(Document, uuid.UUID(template_id))
-    if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
-        raise HTTPException(404, "Template not found")
+    template_doc = await load_template_checked(db, current_user, uuid.UUID(template_id))
 
     storage_cfg = await db.get(StorageConfig, template_doc.storage_config_id)
     if not storage_cfg:
@@ -636,9 +631,7 @@ async def extract_from_file(
     Accepts multiple files (brief, email, quote, scan, etc.). LLM reads all of them
     together and resolves conflicts when the same info appears in multiple places.
     """
-    template_doc = await db.get(Document, uuid.UUID(template_id))
-    if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
-        raise HTTPException(404, "Template not found")
+    template_doc = await load_template_checked(db, current_user, uuid.UUID(template_id))
 
     meta = template_doc.source_metadata or {}
     template_fields = meta.get("template_fields", [])
@@ -794,9 +787,7 @@ async def extract_from_text(
     template_fields: list[dict] = []
 
     if body.template_id:
-        template_doc = await db.get(Document, uuid.UUID(body.template_id))
-        if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
-            raise HTTPException(404, "Template not found")
+        template_doc = await load_template_checked(db, current_user, uuid.UUID(body.template_id))
         meta = template_doc.source_metadata or {}
         template_fields = meta.get("template_fields", [])
     elif body.field_hints:
@@ -904,6 +895,11 @@ async def create_session(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
+    # CHỐNG IDOR (review SEC-P1 + /codex): session lưu template_id → mọi /generate sau dùng nó.
+    # Validate quyền NGAY khi tạo để user không gắn template của người khác vào session.
+    if body.template_id:
+        await load_template_checked(db, current_user, body.template_id)
+
     svc = GeneratorService(db)
     session = await svc.create_session({
         "user_id": current_user.id,

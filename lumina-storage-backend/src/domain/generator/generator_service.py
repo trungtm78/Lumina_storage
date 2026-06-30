@@ -93,6 +93,11 @@ class GeneratorService:
         template_doc = await db.get(Document, template_id)
         if not template_doc or template_doc.source_type != "template" or template_doc.deleted_at is not None:
             raise HTTPException(404, "Template not found")
+        # CHỐNG IDOR (review SEC-P1): core /generate + /sessions/generate — chỉ CHỦ template mới
+        # generate. Defense-in-depth owner-only (404 không leak tồn tại). Handler preview/extract
+        # standalone dùng check_permission (honor ACL share).
+        if template_doc.owner_id != owner_id:
+            raise HTTPException(404, "Template not found")
 
         template_meta = template_doc.source_metadata or {}
         template_fields = template_meta.get("template_fields") or []
@@ -272,6 +277,10 @@ class GeneratorService:
                     from src.models.document import Document as DocModel
                     template_doc = await db.get(DocModel, session.template_id)
                     if template_doc is None or template_doc.deleted_at is not None:
+                        raise HTTPException(404, "Template not found")
+                    # CHỐNG IDOR (review SEC-P1 + /codex): nhánh manual-edit đọc bytes template gốc.
+                    # Owner-only (session.template_id có thể do session-create cũ gắn) → 404 không leak.
+                    if template_doc.owner_id != current_user_id:
                         raise HTTPException(404, "Template not found")
                     tmpl_storage_cfg = await db.get(StorageConfig, template_doc.storage_config_id)
                     tmpl_backend = get_storage_backend(tmpl_storage_cfg)
