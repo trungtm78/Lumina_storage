@@ -267,20 +267,11 @@ class ChatService:
 
     # ── Agent mode ────────────────────────────────────────────────────
 
-    async def stream_agent(
-        self,
-        session_id: uuid.UUID,
-        user_message: str,
-        current_user: User,
-        document_ids: list[uuid.UUID] | None = None,
-        model_id: uuid.UUID | None = None,
-    ) -> AsyncIterator[dict]:
-        """Stream agent responses using LangGraph ReAct agent with tools."""
-        await self.assert_owned(session_id, current_user.id)
-        # Lọc document_ids do client truyền theo quyền (chống IDOR document).
-        document_ids = await self._filter_permitted_documents(current_user, document_ids)
-
-        # 1. Save user message with attachments
+    async def _save_user_message(
+        self, session_id: uuid.UUID, user_message: str, document_ids: list[uuid.UUID] | None
+    ) -> ChatMessage:
+        """Lưu user message (kèm attachment metadata nếu có document_ids), flush. KHÔNG commit
+        (boundary get_db / COMMIT CỐ Ý ở stream_agent). Trích từ stream_agent (P8 W2.3)."""
         attachment_data = None
         if document_ids:
             from src.models.document import Document as DocModel
@@ -300,6 +291,23 @@ class ChatService:
         )
         self.db.add(user_msg)
         await self.db.flush()
+        return user_msg
+
+    async def stream_agent(
+        self,
+        session_id: uuid.UUID,
+        user_message: str,
+        current_user: User,
+        document_ids: list[uuid.UUID] | None = None,
+        model_id: uuid.UUID | None = None,
+    ) -> AsyncIterator[dict]:
+        """Stream agent responses using LangGraph ReAct agent with tools."""
+        await self.assert_owned(session_id, current_user.id)
+        # Lọc document_ids do client truyền theo quyền (chống IDOR document).
+        document_ids = await self._filter_permitted_documents(current_user, document_ids)
+
+        # 1. Save user message with attachments (P8 W2.3: helper _save_user_message)
+        await self._save_user_message(session_id, user_message, document_ids)
 
         # 2. Load history
         history_msgs, _ = await self.get_history(session_id, current_user.id)
