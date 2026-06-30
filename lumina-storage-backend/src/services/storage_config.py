@@ -124,6 +124,17 @@ class StorageConfigService:
 
         return {"success": False, "message": "Unknown backend_type"}
 
+    async def get_upload_limits(self) -> dict:
+        """Giới hạn dung lượng/file hiệu lực từ storage config mặc định (public)."""
+        # Import nội bộ tránh vòng phụ thuộc service↔service ở thời điểm import module.
+        from src.services.document import (
+            _DEFAULT_MAX_UPLOAD_SIZE_MB,
+            _resolve_max_upload_size_mb,
+        )
+        config = await self.repo.get_default()
+        max_mb = _resolve_max_upload_size_mb(config) if config else _DEFAULT_MAX_UPLOAD_SIZE_MB
+        return {"max_upload_size_mb": max_mb}
+
     # --- Admin (system-wide) ---
 
     async def create_config(self, data: StorageConfigCreateRequest) -> StorageConfigResponse:

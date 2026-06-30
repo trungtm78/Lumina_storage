@@ -71,6 +71,10 @@ class UserService:
             raise NotFoundError("User not found")
         return UserResponse.model_validate(user)
 
+    async def get_by_id_with_permissions(self, user_id: uuid.UUID) -> User | None:
+        """User kèm roles/permissions (route /me không gọi repo trực tiếp — Phase 6)."""
+        return await self.user_repo.get_by_id_with_permissions(user_id)
+
     async def update_user(
         self,
         user_id: uuid.UUID,

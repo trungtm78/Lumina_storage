@@ -10,7 +10,7 @@ from src.core.exceptions import UnauthorizedError
 from src.core.security import REFRESH_TOKEN_EXPIRE_DAYS
 from src.core.security import create_access_token, create_refresh_token
 from src.models.user import User
-from src.repositories.user import UserRepository
+from src.services.user import UserService
 from src.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
@@ -125,5 +125,5 @@ async def me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MeResponse:
-    user = await UserRepository(db).get_by_id_with_permissions(current_user.id)
+    user = await UserService(db).get_by_id_with_permissions(current_user.id)
     return MeResponse.model_validate(user)

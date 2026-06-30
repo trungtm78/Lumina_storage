@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_current_user, require_admin
 from src.core.database import get_db
 from src.models.user import User
-from src.repositories.group import GroupRepository
+from src.services.group import GroupService
 from src.schemas.group import GroupResponse
 from src.schemas.user import (
     AdminUserUpdateRequest,
@@ -219,7 +219,7 @@ async def get_auto_group_for_role(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> GroupResponse | None:
-    group = await GroupRepository(db).get_auto_group_by_role(role_id)
+    group = await GroupService(db).get_auto_group_by_role(role_id)
     if not group:
         return None
     return GroupResponse.model_validate(group)

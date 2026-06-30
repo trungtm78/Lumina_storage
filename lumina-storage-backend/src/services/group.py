@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.exceptions import BadRequestError, NotFoundError
+from src.models.group import Group
 from src.models.user import User
 from src.repositories.group import GroupRepository
 from src.repositories.role import RoleRepository
@@ -15,6 +16,10 @@ class GroupService:
         self.group_repo = GroupRepository(session)
         self.role_repo = RoleRepository(session)
         self.user_repo = UserRepository(session)
+
+    async def get_auto_group_by_role(self, role_id: uuid.UUID) -> Group | None:
+        """Nhóm auto gắn với role (route không gọi repo trực tiếp — Phase 6)."""
+        return await self.group_repo.get_auto_group_by_role(role_id)
 
     async def list_groups(self, page: int, page_size: int, search: str | None = None, type: str | None = None) -> tuple[list[GroupResponse], int]:
         groups = await self.group_repo.get_paginated(page, page_size, search, type)

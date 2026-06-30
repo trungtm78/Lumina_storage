@@ -26,15 +26,10 @@ def _svc(db: AsyncSession = Depends(get_db)) -> StorageConfigService:
 
 @router.get("/upload-limits")
 async def get_upload_limits(
-    db: AsyncSession = Depends(get_db),
+    svc: StorageConfigService = Depends(_svc),
 ) -> dict:
     """Return effective per-file upload size limit from the default storage config."""
-    from src.repositories.document import StorageConfigRepository
-    from src.services.document import _DEFAULT_MAX_UPLOAD_SIZE_MB, _resolve_max_upload_size_mb
-    repo = StorageConfigRepository(db)
-    config = await repo.get_default()
-    max_mb = _resolve_max_upload_size_mb(config) if config else _DEFAULT_MAX_UPLOAD_SIZE_MB
-    return {"max_upload_size_mb": max_mb}
+    return await svc.get_upload_limits()
 
 
 # --- System-wide Test ---
