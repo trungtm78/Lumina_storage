@@ -227,15 +227,19 @@ class ChatService:
             sa_delete(ChatSession).where(ChatSession.id == session_id)
         )
 
-        # Delete associated documents
-        if doc_ids_to_delete:
-            for doc_id in doc_ids_to_delete:
-                try:
+        # Delete associated documents — best-effort, từng doc CÔ LẬP bằng savepoint.
+        # ARCH-P2: trước đây `except Exception: pass` nuốt lỗi DB thật → asyncpg POISON
+        # session → flush() cuối vỡ + xóa session không nhất quán. begin_nested() cô lập:
+        # lỗi 1 doc chỉ rollback savepoint đó, session (đã xóa trên) + doc khác vẫn bền.
+        for doc_id in doc_ids_to_delete:
+            try:
+                async with self.db.begin_nested():
                     doc = await self.db.get(DocModel, uuid.UUID(doc_id))
                     if doc:
                         await self.db.delete(doc)
-                except Exception:
-                    pass
+                        await self.db.flush()
+            except Exception:
+                logger.warning("delete_session: xóa doc %s thất bại, bỏ qua", doc_id, exc_info=True)
 
         # Phase 3: commit ở boundary (get_db) — xóa session + docs là MỘT transaction.
         await self.db.flush()
