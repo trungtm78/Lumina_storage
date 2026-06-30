@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, is_admin
+from src.api.deps import CurrentUser
+from src.core.authz import is_admin
 from src.core.database import get_db
 from src.models.processing import BackgroundTask
 from src.worker.dispatch import dispatch_task

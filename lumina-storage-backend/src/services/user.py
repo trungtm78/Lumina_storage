@@ -3,7 +3,7 @@ import uuid
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import is_admin
+from src.core.authz import is_admin
 from src.core.exceptions import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from src.core.security import hash_password, verify_password
 from src.models.user import User

@@ -12,6 +12,7 @@ from jose import JWTError
 from jose import jwt as jose_jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.authz import is_admin
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.exceptions import ForbiddenError, UnauthorizedError
@@ -152,8 +153,7 @@ async def get_current_user(
     return user
 
 
-def is_admin(user: User) -> bool:
-    return any(ur.role.is_default for ur in user.roles if ur.role is not None)
+# is_admin chuyển sang src.core.authz (logic thuần) — re-export giữ tương thích import cũ.
 
 
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:
