@@ -72,7 +72,28 @@ dev = [
     "httpx>=0.27.0",
     "jupyter>=1.1.1",
     "ipykernel>=7.2.0",
+    "import-linter>=2.0,<3.0",
 ]
+
+[tool.importlinter]
+root_package = "src"
+
+# Phase 6 — siết layering: route KHÔNG import repository; service KHÔNG import api.
+# KHÔNG dùng layers-contract: api/deps.py import UserRepository (SSO provisioning) +
+# worker/extraction cross-layer (composition-root) là HỢP LỆ — chỉ chặn 2 rule spec.
+[[tool.importlinter.contracts]]
+name = "Routes must not import repositories"
+type = "forbidden"
+source_modules = ["src.api.v1.routes"]
+forbidden_modules = ["src.repositories"]
+# Chỉ chặn route import repo TRỰC TIẾP; route→service→repo (gián tiếp) là HỢP LỆ.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Services must not import api"
+type = "forbidden"
+source_modules = ["src.services"]
+forbidden_modules = ["src.api"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

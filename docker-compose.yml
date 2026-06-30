@@ -204,6 +204,8 @@ services:
       - ./lumina-storage-backend/src:/app/src:ro
       - ./lumina-storage-backend/tests:/app/tests:ro
       - ./lumina-storage-backend/main.py:/app/main.py:ro
+      # pyproject mount live → import-linter [tool.importlinter] config đổi không cần rebuild.
+      - ./lumina-storage-backend/pyproject.toml:/app/pyproject.toml:ro
     depends_on:
       postgres:
         condition: service_healthy
