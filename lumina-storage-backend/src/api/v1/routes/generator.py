@@ -1354,32 +1354,8 @@ async def delete_session_version(
 
 
 # ─── AI đề xuất chỉnh sửa (block-based) ─────────────────────────────────────────
-
-_AI_REVISE_SYSTEM = (
-    "Bạn là biên tập viên văn bản kinh doanh tiếng Việt. Bạn nhận một tài liệu đã "
-    "được tách thành các block, mỗi block có id và nội dung text. Hãy thực hiện các "
-    "yêu cầu chỉnh sửa bằng cách trả về DANH SÁCH THAO TÁC dạng JSON.\n"
-    "QUY TẮC BẮT BUỘC:\n"
-    "1. Chỉ trả JSON đúng schema, KHÔNG giải thích, KHÔNG markdown.\n"
-    "2. Mỗi thao tác là một trong: \n"
-    '   - {"op":"replace","block_id":"<id>","new_text":"<nội dung mới>"}\n'
-    '   - {"op":"insert_after","block_id":"<id>","kind":"paragraph|heading|list_item","text":"<nội dung>"}\n'
-    '   - {"op":"delete","block_id":"<id>"}\n'
-    "3. block_id PHẢI là id có thật trong danh sách block được cung cấp.\n"
-    "4. TUYỆT ĐỐI không chèn thẻ HTML vào new_text/text — chỉ text thuần.\n"
-    "5. GIỮ NGUYÊN các token dạng {ten_token} nếu có trong block, không xoá/đổi tên chúng.\n"
-    "6. Chỉ tạo thao tác cho những block thực sự cần đổi; block không liên quan thì bỏ qua.\n"
-    'Định dạng trả về: {"ops":[ ... ]}'
-)
-
-
-def _strip_json_fence(raw: str) -> str:
-    s = (raw or "").strip()
-    if s.startswith("```"):
-        s = s.split("\n", 1)[1] if "\n" in s else s[3:]
-        if s.endswith("```"):
-            s = s[: -3]
-    return s.strip()
+# Business-logic AI-revise (_AI_REVISE_SYSTEM/_strip_json_fence/propose_ops) đã trích
+# sang GeneratorService (Phase 8 A3b). Helper stream-disconnect giữ ở route (HTTP-bound).
 
 
 async def _consume_stream_with_disconnect(stream, request) -> str:
@@ -1398,56 +1374,6 @@ async def _consume_stream_with_disconnect(stream, request) -> str:
             raise HTTPException(499, "Client disconnected")
         accumulated += delta
     return accumulated
-
-
-async def _llm_propose_ops(
-    db: AsyncSession, text_map: dict[str, str], instructions: list[str],
-) -> tuple[list[BlockEditOp], list[str]]:
-    """Gọi LLM → danh sách op đã validate. Trả (ops, warnings)."""
-    from src.ai import AIGateway
-
-    warnings: list[str] = []
-    blocks_lines = "\n".join(f"[{bid}] {txt}" for bid, txt in text_map.items())
-    instr_lines = "\n".join(f"- {i}" for i in instructions if i.strip()) or "- (không có)"
-    user_prompt = (
-        f"Danh sách block (id và nội dung):\n{blocks_lines}\n\n"
-        f"Yêu cầu chỉnh sửa:\n{instr_lines}\n\n"
-        'Trả về JSON {"ops":[...]} theo đúng quy tắc.'
-    )
-    messages = [
-        {"role": "system", "content": _AI_REVISE_SYSTEM},
-        {"role": "user", "content": user_prompt},
-    ]
-    gw = AIGateway(db)
-
-    raw = ""
-    for attempt in range(2):
-        try:
-            resp = await gw.complete(
-                messages, response_format={"type": "json_object"}
-            )
-            raw = resp.choices[0].message.content or ""
-            data = json.loads(_strip_json_fence(raw))
-            raw_ops = data.get("ops", data) if isinstance(data, dict) else data
-            if not isinstance(raw_ops, list):
-                raise ValueError("ops không phải list")
-            ops: list[BlockEditOp] = []
-            for item in raw_ops:
-                try:
-                    ops.append(BlockEditOp.model_validate(item))
-                except Exception:
-                    warnings.append("Bỏ qua một thao tác sai định dạng từ AI.")
-            return ops, warnings
-        except (json.JSONDecodeError, ValueError):
-            if attempt == 0:
-                messages.append({"role": "assistant", "content": raw})
-                messages.append({
-                    "role": "user",
-                    "content": 'Phản hồi trước không phải JSON hợp lệ. Trả lại CHỈ JSON {"ops":[...]}.',
-                })
-                continue
-            raise HTTPException(422, "AI không trả về kết quả hợp lệ. Vui lòng thử lại.")
-    return [], warnings
 
 
 @router.post("/sessions/{session_id}/ai-revise", response_model=AiReviseResponse)
@@ -1473,7 +1399,7 @@ async def ai_revise(
         raise HTTPException(422, "Tài liệu chưa có nội dung để chỉnh sửa.")
 
     valid_ids = set(text_map.keys())
-    ops, warnings = await _llm_propose_ops(db, text_map, body.instructions)
+    ops, warnings = await svc.propose_ops(text_map, body.instructions)
 
     # Lọc op trỏ tới block không tồn tại (Tuyến 2).
     kept: list[BlockEditOp] = []

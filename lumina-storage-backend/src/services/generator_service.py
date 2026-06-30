@@ -4,6 +4,7 @@ Phase 6: route KHÔNG truy cập repository trực tiếp → đi qua service n�
 delegate 1-1 sang repo tương ứng; KHÔNG commit (boundary ở get_db). Business-logic nặng
 (patch DOCX, sinh PDF, AI-revise) vẫn ở route — Phase 8 trích dần (A3: execute_generate).
 """
+import json
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -17,6 +18,7 @@ from src.repositories.generator import (
     GeneratorSessionRepository,
     GeneratorSessionVersionRepository,
 )
+from src.schemas.generator import BlockEditOp
 from src.services.generator_docx import (
     _iter_all_paragraphs,
     _merge_runs,
@@ -24,6 +26,33 @@ from src.services.generator_docx import (
     _validate_field_values,
 )
 from src.services.storage import get_storage_backend
+
+# System prompt cho AI-revise block-based (LLM chỉ thao tác TEXT theo block-id).
+_AI_REVISE_SYSTEM = (
+    "Bạn là biên tập viên văn bản kinh doanh tiếng Việt. Bạn nhận một tài liệu đã "
+    "được tách thành các block, mỗi block có id và nội dung text. Hãy thực hiện các "
+    "yêu cầu chỉnh sửa bằng cách trả về DANH SÁCH THAO TÁC dạng JSON.\n"
+    "QUY TẮC BẮT BUỘC:\n"
+    "1. Chỉ trả JSON đúng schema, KHÔNG giải thích, KHÔNG markdown.\n"
+    "2. Mỗi thao tác là một trong: \n"
+    '   - {"op":"replace","block_id":"<id>","new_text":"<nội dung mới>"}\n'
+    '   - {"op":"insert_after","block_id":"<id>","kind":"paragraph|heading|list_item","text":"<nội dung>"}\n'
+    '   - {"op":"delete","block_id":"<id>"}\n'
+    "3. block_id PHẢI là id có thật trong danh sách block được cung cấp.\n"
+    "4. TUYỆT ĐỐI không chèn thẻ HTML vào new_text/text — chỉ text thuần.\n"
+    "5. GIỮ NGUYÊN các token dạng {ten_token} nếu có trong block, không xoá/đổi tên chúng.\n"
+    "6. Chỉ tạo thao tác cho những block thực sự cần đổi; block không liên quan thì bỏ qua.\n"
+    'Định dạng trả về: {"ops":[ ... ]}'
+)
+
+
+def _strip_json_fence(raw: str) -> str:
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else s[3:]
+        if s.endswith("```"):
+            s = s[: -3]
+    return s.strip()
 
 
 class GeneratorService:
@@ -118,6 +147,55 @@ class GeneratorService:
         await db.flush()
         await db.refresh(rendered_doc)
         return rendered_doc, out_filename, applied_count
+
+    async def propose_ops(
+        self, text_map: dict[str, str], instructions: list[str]
+    ) -> tuple[list[BlockEditOp], list[str]]:
+        """Gọi LLM → danh sách op đã validate. Trả (ops, warnings)."""
+        from src.ai import AIGateway
+
+        warnings: list[str] = []
+        blocks_lines = "\n".join(f"[{bid}] {txt}" for bid, txt in text_map.items())
+        instr_lines = "\n".join(f"- {i}" for i in instructions if i.strip()) or "- (không có)"
+        user_prompt = (
+            f"Danh sách block (id và nội dung):\n{blocks_lines}\n\n"
+            f"Yêu cầu chỉnh sửa:\n{instr_lines}\n\n"
+            'Trả về JSON {"ops":[...]} theo đúng quy tắc.'
+        )
+        messages = [
+            {"role": "system", "content": _AI_REVISE_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ]
+        gw = AIGateway(self._session)
+
+        raw = ""
+        for attempt in range(2):
+            try:
+                resp = await gw.complete(
+                    messages, response_format={"type": "json_object"}
+                )
+                raw = resp.choices[0].message.content or ""
+                data = json.loads(_strip_json_fence(raw))
+                raw_ops = data.get("ops", data) if isinstance(data, dict) else data
+                if not isinstance(raw_ops, list):
+                    raise ValueError("ops không phải list")
+                ops: list[BlockEditOp] = []
+                for item in raw_ops:
+                    try:
+                        ops.append(BlockEditOp.model_validate(item))
+                    except Exception:
+                        warnings.append("Bỏ qua một thao tác sai định dạng từ AI.")
+                return ops, warnings
+            except (json.JSONDecodeError, ValueError):
+                if attempt == 0:
+                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({
+                        "role": "user",
+                        "content": 'Phản hồi trước không phải JSON hợp lệ. Trả lại CHỈ JSON {"ops":[...]}.',
+                    })
+                    continue
+                raise HTTPException(422, "AI không trả về kết quả hợp lệ. Vui lòng thử lại.")
+        return [], warnings
 
     # ── Session ──────────────────────────────────────────────────────────────
     async def create_session(self, data: dict) -> GeneratorSession:

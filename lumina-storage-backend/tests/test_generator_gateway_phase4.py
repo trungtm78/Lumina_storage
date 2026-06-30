@@ -14,11 +14,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.api.v1.routes.generator import (
-    _consume_stream_with_disconnect,
-    _llm_propose_ops,
-)
+from src.api.v1.routes.generator import _consume_stream_with_disconnect
 from src.models.core import AIModelConfig
+from src.services.generator_service import GeneratorService
 
 pytestmark = pytest.mark.asyncio
 
@@ -42,8 +40,8 @@ async def test_propose_ops_keeps_response_format_and_nonstream(db_session):
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"ops": []}'))]
     )
     with patch("litellm.acompletion", new=AsyncMock(return_value=fake)) as m:
-        ops, warnings = await _llm_propose_ops(
-            db_session, {"b1": "hello"}, ["in đậm"]
+        ops, warnings = await GeneratorService(db_session).propose_ops(
+            {"b1": "hello"}, ["in đậm"]
         )
 
     assert ops == []
