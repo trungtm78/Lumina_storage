@@ -3,10 +3,9 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import asdict
 
 from langchain_community.chat_models import ChatLiteLLM
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,17 +19,16 @@ from src.models.chat import ChatMessage, ChatMessageSource, ChatSession
 from src.models.user import User
 from src.schemas.chat import MessageSourceResponse
 from src.models.core import AIModelConfig
-from src.repositories.document import DocumentRepository
 from src.services.agent import (
     AgentDeps,
     AgentResultCollector,
-    Citation,
     build_model,
     build_system_prompt,
     convert_history,
     create_agent,
 )
 from src.services.ai_model_config_service import build_litellm_model
+from src.services.chat_permission_service import ChatPermissionService
 from src.services.document_permission import DocumentPermissionService
 from src.services.embedding_service import EmbeddingService
 from src.services.skill_service import SkillService
@@ -90,11 +88,7 @@ async def _generate_title_background(
 
 
 # Phase 7: citation builders chuyển sang src/services/citation_service.py (tách god-service).
-from src.services.citation_service import (  # noqa: E402
-    _coerce_uuid,
-    citation_to_source,
-    citations_to_sources,
-)
+from src.services.citation_service import citations_to_sources  # noqa: E402
 
 
 class ChatService:
@@ -106,6 +100,7 @@ class ChatService:
         # objects are lazy — see _ensure_embedding_svc and _ensure_llm.
         self._embedding_svc: EmbeddingService | None = None
         self._llm: ChatLiteLLM | None = None
+        self._permission = ChatPermissionService(db)
         self.vector_svc = VectorService(settings)
         self.last_sources: list[MessageSourceResponse] = []
         self.prompt = ChatPromptTemplate.from_messages([
@@ -183,12 +178,9 @@ class ChatService:
         return rows[:limit], has_more
 
     async def assert_owned(self, session_id: uuid.UUID, user_id: uuid.UUID) -> ChatSession:
-        """Trả session nếu thuộc user; raise NotFoundError (→404) nếu không tồn tại
-        hoặc không thuộc user. Chống IDOR — không lộ sự tồn tại của session người khác."""
-        session = await self.db.get(ChatSession, session_id)
-        if session is None or session.user_id != user_id or session.deleted_at is not None:
-            raise NotFoundError("Session not found")
-        return session
+        """Delegate IDOR/ownership check sang ChatPermissionService (P8 W2.1). Giữ method này
+        để 4 call-site nội bộ + route gọi `svc.assert_owned(...)` không đổi."""
+        return await self._permission.assert_owned(session_id, user_id)
 
     async def _filter_permitted_documents(self, user, document_ids):
         """Lọc document_ids → chỉ giữ doc user có quyền viewer (chống IDOR document).
