@@ -100,8 +100,9 @@ async def test_dispatch_commits_pending_business_data_before_enqueue(db_session,
     assert seen == [True]
 
 
-async def test_dispatch_job_none_dedupe_collision_keeps_pending(db_session, test_user):
-    """ARQ dedupe collision → enqueue_job trả None: record vẫn bền, status pending, job_id None."""
+async def test_dispatch_job_none_keeps_pending(db_session, test_user):
+    """enqueue_job trả None bất thường (Phase 8: KHÔNG còn do dedupe — job_id giờ unique):
+    record vẫn bền, status pending, job_id None (recoverable)."""
     async def none_enqueue(*_a, **_k):
         return None
 

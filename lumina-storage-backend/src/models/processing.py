@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -53,6 +53,16 @@ class BackgroundTask(Base):
     __table_args__ = (
         Index("idx_backgroundtask_job_id", "job_id"),
         Index("idx_backgroundtask_owner", "owner_id"),
+        # Phase 8 T1: chống concurrent double-enqueue — chỉ 1 task in-flight (pending/running)
+        # cho mỗi (task_name, related_id). Insert thứ 2 đồng thời → IntegrityError → dispatch
+        # bắt + trả task đang chạy (atomic, diệt TOCTOU; tránh clobber active_ingest_version).
+        Index(
+            "uq_backgroundtask_inflight",
+            "task_name",
+            "related_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
     )
 
     owner: Mapped["User | None"] = relationship("User")
