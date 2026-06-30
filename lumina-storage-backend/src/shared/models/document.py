@@ -5,7 +5,7 @@ from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKe
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from src.models.base import Base, TimestampMixin
+from src.shared.models.base import Base, TimestampMixin
 
 
 class Folder(TimestampMixin, Base):

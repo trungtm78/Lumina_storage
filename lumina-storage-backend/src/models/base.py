@@ -1,25 +1,10 @@
-import uuid
-from datetime import UTC, datetime
+"""Shim (Phase 8 W3 Task A): Base/TimestampMixin đã chuyển sang src/shared/models/base.py.
 
-from sqlalchemy import DateTime, func
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+Base (DeclarativeBase, sở hữu Base.metadata dùng chung) đặt ở shared để model ở src/shared/models/
+import Base TỪ shared — KHÔNG trigger src.models.__init__ (gỡ re-entrant import codex P2). Re-export
+TƯỜNG MINH cùng Base object → MỌI model (cũ qua shim này + mới qua shared) register CÙNG metadata.
+Xem plan W3 §Task A.
+"""
+from src.shared.models.base import Base, TimestampMixin  # noqa: F401
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-class TimestampMixin:
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=lambda: datetime.now(UTC),
-        nullable=False,
-    )
+__all__ = ["Base", "TimestampMixin"]
