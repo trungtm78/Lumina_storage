@@ -20,8 +20,10 @@ register(LocalHybridProvider.name, LocalHybridProvider)
 
 # Provider ngoài — import module an toàn (SDK lazy bên trong extract/test_connection;
 # import provider module KHÔNG kéo SDK). Gemini qua litellm (luôn khả dụng).
+from src.extraction.providers.azure_di import AzureDIProvider  # noqa: E402
 from src.extraction.providers.gemini import GeminiProvider  # noqa: E402
 from src.extraction.providers.mistral import MistralProvider  # noqa: E402
 
 register(GeminiProvider.name, GeminiProvider)
 register(MistralProvider.name, MistralProvider)
+register(AzureDIProvider.name, AzureDIProvider)
