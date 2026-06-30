@@ -6,19 +6,12 @@ structured fixes, optional comparison, bilingual (Vi/En) output.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
-import re
 import uuid
-import zipfile
 
 _log = logging.getLogger(__name__)
 
 from datetime import datetime
-from io import BytesIO
-from typing import Literal
-from urllib.parse import quote as _urlquote
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,8 +24,6 @@ from src.core.config import get_settings
 from src.core.database import get_db
 from src.models.document import Document
 from src.models.review import ReviewJob, ReviewJobVersion
-from src.models.user import User
-from src.services.document_permission import DocumentPermissionService
 from src.services.review_export import (
     build_legal_eval_html,
     build_tracked_changes_docx,
@@ -43,32 +34,14 @@ router = APIRouter(prefix="/review", tags=["review"])
 
 
 from src.schemas.review import (
-    ChecklistResult,
-    ComparisonResult,
-    DocHighlight,
-    DocSource,
-    EditEvaluation,
-    FixSuggestion,
-    HighlightSeverity,
-    HighlightType,
-    KeyInfoItem,
     QuickActionRequest,
     QuickActionResult,
-    QuickActionType,
     RecalculateScoreRequest,
-    ReferenceFinding,
-    ReferenceResult,
     ReviewConfig,
-    ReviewReport,
-    ReviewType,
-    RiskBreakdownItem,
     SaveSessionEventsRequest,
     SaveVersionRequest,
-    SessionEventData,
-    SeverityLabel,
     SuggestChecklistRequest,
     SuggestChecklistResponse,
-    TemplateSource,
     UpdateStatusRequest,
     VersionResponse,
 )
@@ -78,15 +51,10 @@ from src.schemas.review import (
 
 from src.services.review_helpers import (
     _EDIT_RATE,
-    _KEY_INFO_GROUPS,
     _MAX_DOC_CHARS,
     _RISK_IMPACT,
     _SCORE_FLOOR,
-    _SYSTEM_REVIEW_PROMPT,
     _apply_proportional_risk,
-    _build_highlights,
-    _build_review_prompt,
-    _calculate_formula_score,
     _clamp_score,
     _clean_edit_text,
     _content_disposition,
@@ -96,469 +64,24 @@ from src.services.review_helpers import (
     _find_best_verbatim_match,
     _find_clause_label,
     _get_catalog,
-    _normalize_ws,
-    _parse_edit_type,
     _resolve_checklist_labels,
-    _safe_json_loads,
     _sanitize_user_input,
     _slugify,
     _str_list,
-    _verbatim_confidence,
 )
 
 from src.services.review_helpers import (
     _convert_doc_to_docx,
-    _detect_bilingual,
     _extract_docx_numbered_items,
     _extract_docx_outline,
     _extract_text,
     _extract_track_changes,
-    _format_revisions,
 )
 
 
 # ─── Step 4: Storage helpers ──────────────────────────────────────────────────
 
-async def _read_document_bytes(
-    db: AsyncSession,
-    document_id: str,
-    current_user: User,
-) -> tuple[str, bytes]:
-    """Đọc (filename, raw_bytes) từ storage backend."""
-    try:
-        doc_uuid = uuid.UUID(document_id)
-    except (ValueError, AttributeError):
-        raise HTTPException(400, f"Invalid document_id: {document_id}")
-    await DocumentPermissionService(db).check_permission(
-        current_user, document_id=doc_uuid, required="viewer"
-    )
-    doc = await db.get(Document, doc_uuid)
-    if not doc or doc.deleted_at is not None:
-        raise HTTPException(404, "Document not found")
-
-    from src.models.storage import StorageConfig
-
-    storage_cfg = await db.get(StorageConfig, doc.storage_config_id)
-    if not storage_cfg:
-        raise HTTPException(500, "Storage config not found")
-
-    backend = get_storage_backend(storage_cfg)
-    doc_bytes = await backend.read(doc.file_path)
-    return doc.original_filename, doc_bytes
-
-
-async def _read_document_text(
-    db: AsyncSession,
-    document_id: str,
-    current_user: User,
-) -> tuple[str, str]:
-    """Đọc (filename, extracted_text) — chạy extract trong thread pool."""
-    filename, doc_bytes = await _read_document_bytes(db, document_id, current_user)
-    # _extract_text gọi blocking I/O (httpx.post Gotenberg, fitz CPU work)
-    # → run trong thread pool để không block async event loop
-    text = await asyncio.to_thread(_extract_text, doc_bytes, filename)
-    return filename, text
-
-
-# ─── Step 5: LLM prompt builder ──────────────────────────────────────────────
-#
-# Prompt design principles:
-# - Dùng <untrusted_data> tags bao quanh nội dung người dùng → LLM không treat
-#   chúng như instructions (tránh prompt injection)
-# - [CLAUSE_NUMBERING_MAP]: reference-only outline với số thứ tự điều khoản
-# - [BILINGUAL DOCUMENT]: khi detect bilingual, yêu cầu LLM output đồng thời
-#   cả 6 fields VN+EN cho mỗi edit
-# - Schema JSON tường minh để LLM output parse được ngay
-
-
-
-
-async def _call_llm(prompt: str, db: AsyncSession) -> dict:
-    """Gọi LLM với system prompt review, trả về parsed JSON dict.
-
-    Phase 4 T5: qua AIGateway (điểm vào duy nhất). complete() force stream=False;
-    overrides temperature=0/seed=42 giữ tính DETERMINISTIC của chấm điểm review (C1).
-    """
-    from src.ai import AIGateway
-
-    response = await AIGateway(db).complete(
-        [
-            {"role": "system", "content": _SYSTEM_REVIEW_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        seed=42,
-    )
-    return _safe_json_loads(response.choices[0].message.content or "")
-
-
-# ─── Step 7: Risk scoring ─────────────────────────────────────────────────────
-#
-# Công thức blend formula + AI score:
-#   formula_risk = checklist_risk * 0.5 + edit_risk * 0.5 + missing_contrib + errors_contrib
-#   blended = formula_risk * 0.70 + ai_score * 0.30 (khi có signals khách quan)
-#
-# Proportional accumulation (không linear):
-#   mỗi item chiếm rate% headroom còn lại → N vấn đề nhỏ không bao giờ bằng 1 vấn đề lớn
-
-
-
-
-async def _run_review(
-    db: AsyncSession,
-    job_id: str,
-    doc_name: str,
-    doc_text: str,
-    config: ReviewConfig,
-    checklist_labels: list[tuple[str, str]],
-    template_text: str | None,
-    doc_revisions: list[dict] | None = None,
-    template_revisions: list[dict] | None = None,
-    reference_texts: list[tuple[str, str]] | None = None,
-    doc_outline: str | None = None,
-    template_outline: str | None = None,
-) -> ReviewReport:
-    # 10.1 Truncation warning (LLM context limit)
-    # Strategy: keep 2/3 head + 1/3 tail — contract clauses (penalty, termination, signatures)
-    # often appear at the end; cutting only from head avoids missing critical sections.
-    truncation_warning: str | None = None
-    if len(doc_text) > _MAX_DOC_CHARS:
-        _head = _MAX_DOC_CHARS * 2 // 3
-        _tail = _MAX_DOC_CHARS - _head
-        truncation_warning = (
-            f"Tài liệu dài {len(doc_text):,} ký tự đã được cắt ngắn còn {_MAX_DOC_CHARS:,} ký tự "
-            f"(giữ {_head:,} ký tự đầu + {_tail:,} ký tự cuối). "
-            "Nội dung ở giữa tài liệu có thể chưa được đánh giá đầy đủ."
-        )
-        doc_text = (
-            doc_text[:_head]
-            + "\n\n…[nội dung giữa đã lược bỏ để vừa giới hạn phân tích]…\n\n"
-            + doc_text[-_tail:]
-        )
-
-    # 10.2 Identical check (skip template comparison khi 2 doc giống hệt nhau)
-    is_identical = False
-    if template_text:
-        if " ".join(doc_text.split()) == " ".join(template_text.split()):
-            is_identical = True
-
-    # 10.3 Bilingual detection
-    is_bilingual = _detect_bilingual(doc_text)
-
-    # 10.4 Build prompt + call LLM
-    prompt = _build_review_prompt(
-        doc_text,
-        config,
-        checklist_labels,
-        None if is_identical else template_text,
-        doc_revisions=doc_revisions,
-        template_revisions=template_revisions,
-        additional_requirements=config.additional_requirements,
-        reference_texts=reference_texts,
-        reference_content=config.reference_content,
-        is_bilingual=is_bilingual,
-        has_reference=bool(reference_texts),
-        doc_outline=doc_outline,
-        template_outline=None if is_identical else template_outline,
-    )
-    data = await _call_llm(prompt, db)
-
-    # 10.5 Parse checklist — mỗi id từ checklist_labels phải có trong response;
-    #      nếu AI bỏ qua, tạo fallback với ai_evaluated=False
-    checklist_results: list[ChecklistResult] = []
-    returned_checklist = {
-        c.get("id"): c for c in data.get("checklist", []) if c.get("id")
-    }
-    _VALID_CL_STATUS = {"pass", "warning", "risk"}
-    for cid, label in checklist_labels:
-        item = returned_checklist.get(cid, {})
-        ai_evaluated = cid in returned_checklist
-        raw_status = item.get("status", "")
-        passed = bool(item.get("passed", False))
-        resolved_status = (
-            raw_status if raw_status in _VALID_CL_STATUS
-            else ("pass" if passed else "risk")
-        )
-        checklist_results.append(
-            ChecklistResult(
-                id=cid,
-                label=item.get("label") or label,
-                passed=resolved_status == "pass",
-                anchorKeyword=item.get("anchorKeyword") or None,
-                status=resolved_status,
-                note=item.get("note") or None,
-                ai_evaluated=ai_evaluated,
-            )
-        )
-
-    key_issues: list[str] = [str(i) for i in data.get("keyIssues", []) if i]
-    missing_items: list[str] = [str(i) for i in data.get("missingItems", []) if i]
-
-    # 10.6 Parse fixes (issueIndex phải trỏ đến keyIssues hợp lệ)
-    fixes: list[FixSuggestion] = []
-    for f in data.get("fixes", []):
-        try:
-            idx = int(f.get("issueIndex", -1))
-        except (TypeError, ValueError):
-            continue
-        if 0 <= idx < len(key_issues):
-            fixes.append(FixSuggestion(issueIndex=idx, suggestion=str(f.get("suggestion", ""))))
-
-    # 10.7 Parse edits với verbatim validation
-    #      - Discard edit nếu modified_text không match trong doc_text
-    #      - Bilingual: discard toàn bộ edit nếu thiếu EN counterpart
-    comparison: ComparisonResult | None = None
-    if template_text and is_identical:
-        comparison = ComparisonResult(
-            is_identical=True, differences=[], missingClauses=[], conflictTerms=[], edits=[]
-        )
-    elif cmp := data.get("comparison"):
-        _edits: list[EditEvaluation] = []
-        for i, e in enumerate(cmp.get("edits", []) or []):
-            verdict = e.get("verdict", "disagree")
-            if verdict not in ("agree", "disagree"):
-                verdict = "disagree"
-            risk = e.get("risk_level", "medium")
-            if risk not in ("high", "medium", "low"):
-                risk = "medium"
-            cat = e.get("suggestion_category", "")
-            if cat not in ("improve", "reduce", "rewrite"):
-                cat = "rewrite" if risk == "high" else "reduce" if risk == "medium" else "improve"
-            modified = _clean_edit_text(str(e.get("modified_text", "")))
-            if not modified:
-                continue
-            # Verbatim check với fuzzy recovery
-            verbatim_ok, matched_text = _find_best_verbatim_match(modified, doc_text)
-            if not verbatim_ok:
-                continue
-            modified = matched_text
-            anchor_text = _clean_edit_text(matched_text[:40])
-
-            # Confidence: exact match → high; fuzzy 80-95% → medium
-            edit_confidence = _verbatim_confidence(modified, doc_text)
-
-            # Đối chiếu với outline để tự động lấy số điều khoản chính xác
-            resolved_label = _find_clause_label(matched_text, doc_outline)
-            clause_name = resolved_label if resolved_label else str(e.get("clause_name", ""))
-
-            bilingual_anchor = _clean_edit_text(str(e.get("bilingual_anchor_text", ""))) or None
-            bilingual_modified = _clean_edit_text(str(e.get("bilingual_modified_text", ""))) or None
-            bilingual_suggested = str(e.get("bilingual_suggested_text", "")).strip() or None
-
-            if is_bilingual:
-                # Bilingual: bắt buộc có đủ EN counterpart — thiếu → discard
-                if not bilingual_modified or not bilingual_suggested:
-                    continue
-                # Fuzzy match cho bilingual EN text
-                b_verbatim_ok, b_matched = _find_best_verbatim_match(bilingual_modified, doc_text)
-                if not b_verbatim_ok:
-                    continue
-                bilingual_modified = b_matched
-                bilingual_anchor = _clean_edit_text(b_matched[:40])
-
-            _edits.append(
-                EditEvaluation(
-                    id=str(e.get("id") or f"e{i + 1}"),
-                    clause_name=clause_name,
-                    original_text=str(e.get("original_text", "")),
-                    modified_text=modified,
-                    anchor_text=anchor_text,
-                    verdict=verdict,
-                    reason=str(e.get("reason", "")),
-                    suggested_text=str(e.get("suggested_text", "")),
-                    risk_level=risk,
-                    suggestion_category=cat,
-                    score_impact=_RISK_IMPACT.get(risk, 8),
-                    verbatim_match=True,
-                    confidence=edit_confidence,
-                    edit_type=_parse_edit_type(str(e.get("edit_type", "other"))),
-                    bilingual_anchor_text=bilingual_anchor,
-                    bilingual_modified_text=bilingual_modified,
-                    bilingual_suggested_text=bilingual_suggested,
-                )
-            )
-        comparison = ComparisonResult(
-            is_identical=bool(cmp.get("is_identical", False)),
-            differences=[str(x) for x in cmp.get("differences", [])] if template_text else [],
-            missingClauses=[str(x) for x in cmp.get("missingClauses", [])] if template_text else [],
-            conflictTerms=[str(x) for x in cmp.get("conflictTerms", [])] if template_text else [],
-            edits=_edits,
-        )
-
-    # 10.8 Parse keyInformation — chuẩn hóa về 10 groups cố định, đúng thứ tự
-    raw_key_info = data.get("keyInformation") or []
-    ki_by_group: dict[str, str | None] = {}
-    for ki in raw_key_info:
-        if isinstance(ki, dict) and ki.get("group"):
-            v = ki.get("value")
-            ki_by_group[ki["group"]] = str(v) if v else None
-    key_information: list[KeyInfoItem] = [
-        KeyInfoItem(group=g, value=ki_by_group.get(g)) for g in _KEY_INFO_GROUPS
-    ]
-
-    detected_errors: list[str] = [str(e) for e in (data.get("detectedErrors") or []) if e]
-    risk_factors: list[str] = [str(f) for f in (data.get("riskFactors") or []) if f]
-
-    risk_breakdown: list[RiskBreakdownItem] = []
-    for rb in (data.get("riskBreakdown") or []):
-        if isinstance(rb, dict) and rb.get("category"):
-            risk_breakdown.append(
-                RiskBreakdownItem(
-                    category=str(rb["category"]),
-                    score=_clamp_score(rb.get("score", 50)),
-                    issues=[str(iss) for iss in (rb.get("issues") or []) if iss],
-                )
-            )
-
-    reference_results: list[ReferenceResult] = []
-    for rr in (data.get("referenceResults") or []):
-        if not isinstance(rr, dict) or not rr.get("reference_name"):
-            continue
-        parsed_findings: list[ReferenceFinding] = []
-        for f in (rr.get("findings") or []):
-            if isinstance(f, dict):
-                text = str(f.get("text") or f.get("finding") or "").strip()
-                anchor = str(f.get("anchorKeyword") or "").strip() or None
-                suggested = str(f.get("suggested_text") or "").strip() or None
-                violated = str(f.get("violated_rule") or "").strip() or None
-                if text:
-                    parsed_findings.append(ReferenceFinding(
-                        text=text,
-                        anchorKeyword=anchor,
-                        suggested_text=suggested,
-                        violated_rule=violated,
-                    ))
-            elif isinstance(f, str) and f.strip():
-                parsed_findings.append(ReferenceFinding(text=f.strip(), anchorKeyword=None))
-        reference_results.append(
-            ReferenceResult(reference_name=str(rr["reference_name"]), findings=parsed_findings)
-        )
-
-    # 10.8b Convert reference findings with suggested_text → EditEvaluation
-    # Allows FE to highlight and apply reference-compliance fixes same as regular edits.
-    ref_edits_to_add: list[EditEvaluation] = []
-    if reference_results and comparison is not None:
-        existing_anchors = {
-            _normalize_ws(e.anchor_text or e.modified_text[:40])
-            for e in comparison.edits
-        }
-        for rr_idx, rr in enumerate(reference_results):
-            for f_idx, f in enumerate(rr.findings):
-                if not f.suggested_text or not f.anchorKeyword:
-                    continue
-                anchor_norm = _normalize_ws(f.anchorKeyword)
-                if anchor_norm in existing_anchors:
-                    continue  # skip — already covered in comparison.edits
-                verbatim_ok, matched = _find_best_verbatim_match(f.anchorKeyword, doc_text)
-                if not verbatim_ok:
-                    continue
-                existing_anchors.add(_normalize_ws(matched[:40]))
-                ref_edits_to_add.append(EditEvaluation(
-                    id=f"ref_{rr_idx}_{f_idx}",
-                    clause_name=f.violated_rule or rr.reference_name,
-                    original_text="",
-                    modified_text=matched,
-                    anchor_text=_clean_edit_text(matched[:40]),
-                    verdict="disagree",
-                    reason=f.text + (f" (vi phạm: {f.violated_rule})" if f.violated_rule else ""),
-                    suggested_text=f.suggested_text,
-                    risk_level="high",
-                    suggestion_category="rewrite",
-                    score_impact=_RISK_IMPACT["high"],
-                    verbatim_match=True,
-                    confidence=_verbatim_confidence(matched, doc_text),
-                    edit_type="inconsistency",
-                ))
-        if ref_edits_to_add:
-            comparison = ComparisonResult(
-                is_identical=comparison.is_identical,
-                differences=comparison.differences,
-                missingClauses=comparison.missingClauses,
-                conflictTerms=comparison.conflictTerms,
-                edits=ref_edits_to_add + comparison.edits,
-            )
-    elif reference_results and comparison is None:
-        # No compare mode but reference mode — create comparison to hold ref edits
-        ref_edits_to_add = []
-        for rr_idx, rr in enumerate(reference_results):
-            for f_idx, f in enumerate(rr.findings):
-                if not f.suggested_text or not f.anchorKeyword:
-                    continue
-                verbatim_ok, matched = _find_best_verbatim_match(f.anchorKeyword, doc_text)
-                if not verbatim_ok:
-                    continue
-                ref_edits_to_add.append(EditEvaluation(
-                    id=f"ref_{rr_idx}_{f_idx}",
-                    clause_name=f.violated_rule or rr.reference_name,
-                    original_text="",
-                    modified_text=matched,
-                    anchor_text=_clean_edit_text(matched[:40]),
-                    verdict="disagree",
-                    reason=f.text + (f" (vi phạm: {f.violated_rule})" if f.violated_rule else ""),
-                    suggested_text=f.suggested_text,
-                    risk_level="high",
-                    suggestion_category="rewrite",
-                    score_impact=_RISK_IMPACT["high"],
-                    verbatim_match=True,
-                    confidence=_verbatim_confidence(matched, doc_text),
-                    edit_type="inconsistency",
-                ))
-        if ref_edits_to_add:
-            comparison = ComparisonResult(
-                is_identical=False,
-                differences=[],
-                missingClauses=[],
-                conflictTerms=[],
-                edits=ref_edits_to_add,
-            )
-
-    # 10.9 Calculate blended risk score
-    all_edits = comparison.edits if comparison else []
-    ai_score = _clamp_score(data.get("riskScore", 50))
-    blended_score = _calculate_formula_score(
-        checklist_results, all_edits, ai_score,
-        missing_items=missing_items,
-        detected_errors=detected_errors,
-    )
-
-    # 10.10 Build highlights
-    highlights = _build_highlights(
-        edits=all_edits,
-        checklist_results=checklist_results,
-        has_compare=bool(template_text),
-        has_reference=bool(reference_texts),
-        reference_results=reference_results or None,
-    )
-
-    is_bilingual_result = bool(data.get("is_bilingual", False)) or is_bilingual
-
-    return ReviewReport(
-        job_id=job_id,
-        document_name=doc_name,
-        review_type=config.review_type,
-        created_at=datetime.utcnow().isoformat(),
-        summary=str(data.get("summary", "")),
-        riskExplanation=str(data.get("riskExplanation", "")),
-        keyIssues=key_issues,
-        missingItems=missing_items,
-        suggestions=[str(i) for i in data.get("suggestions", []) if i],
-        checklist=checklist_results,
-        riskScore=blended_score,
-        highlights=highlights,
-        fixes=fixes,
-        comparison=comparison,
-        keyInformation=key_information,
-        detectedErrors=detected_errors,
-        truncation_warning=truncation_warning,
-        riskFactors=risk_factors,
-        riskBreakdown=risk_breakdown,
-        referenceResults=reference_results,
-        is_bilingual=is_bilingual_result,
-    )
-
-
-# ─── Checklist label catalog ──────────────────────────────────────────────────
-
+from src.services.review_service import ReviewService
 
 # ─── PDF pre-generation (fire-and-forget) ────────────────────────────────────
 
@@ -671,20 +194,6 @@ async def _persist_eval_pdf(
 
 # ─── Job loader ───────────────────────────────────────────────────────────────
 
-async def _load_job(db: AsyncSession, job_id: str, user_id: uuid.UUID) -> ReviewJob:
-    try:
-        job_uuid = uuid.UUID(job_id)
-    except (ValueError, AttributeError):
-        raise HTTPException(400, f"Invalid job_id: {job_id}")
-    stmt = select(ReviewJob).where(
-        ReviewJob.id == job_uuid,
-        ReviewJob.user_id == user_id,
-        ReviewJob.deleted_at.is_(None),
-    )
-    row = (await db.execute(stmt)).scalar_one_or_none()
-    if not row:
-        raise HTTPException(404, "Review result not found")
-    return row
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -709,7 +218,7 @@ async def start_review(
     db: AsyncSession = Depends(get_db),
 ):
     # 1. Đọc tài liệu chính
-    doc_name, doc_bytes = await _read_document_bytes(db, body.document_id, current_user)
+    doc_name, doc_bytes = await ReviewService(db).read_document_bytes(body.document_id, current_user)
 
     # 2. Extract text, outline, track changes song song
     doc_text = await asyncio.to_thread(_extract_text, doc_bytes, doc_name)
@@ -728,7 +237,7 @@ async def start_review(
         per_cap = max(50000, 200000 // n_tmpl)
         for idx, cid in enumerate(body.compare_document_ids[:3]):
             try:
-                tmpl_name, tmpl_bytes = await _read_document_bytes(db, cid, current_user)
+                tmpl_name, tmpl_bytes = await ReviewService(db).read_document_bytes(cid, current_user)
                 tmpl_text = await asyncio.to_thread(_extract_text, tmpl_bytes, tmpl_name)
                 tmpl_revs = _extract_track_changes(tmpl_bytes, tmpl_name)
                 tmpl_outline = await asyncio.to_thread(_extract_docx_outline, tmpl_bytes, tmpl_name)
@@ -756,7 +265,7 @@ async def start_review(
     if body.reference_enabled and body.reference_doc_ids:
         for rid in body.reference_doc_ids[:5]:
             try:
-                ref_name, ref_bytes = await _read_document_bytes(db, rid, current_user)
+                ref_name, ref_bytes = await ReviewService(db).read_document_bytes(rid, current_user)
                 ref_text = await asyncio.to_thread(_extract_text, ref_bytes, ref_name)
                 reference_texts.append((ref_name, ref_text))
             except HTTPException:
@@ -772,8 +281,8 @@ async def start_review(
 
     # 6. Run review pipeline
     job_id = str(uuid.uuid4())
-    report = await _run_review(
-        db, job_id, doc_name, doc_text, body, checklist_labels, template_text,
+    report = await ReviewService(db).run_review(
+        job_id, doc_name, doc_text, body, checklist_labels, template_text,
         doc_revisions=doc_revisions,
         template_revisions=template_revisions,
         reference_texts=reference_texts or None,
@@ -828,7 +337,7 @@ async def get_review_result(
     db: AsyncSession = Depends(get_db),
 ):
     """Lấy kết quả review đã lưu. Không mutate row.report — build response dict riêng."""
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     result = dict(row.report)
     result["sessionEvents"] = row.session_events or []
     return result
@@ -844,7 +353,7 @@ async def get_document_text(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    filename, doc_bytes = await _read_document_bytes(db, document_id, current_user)
+    filename, doc_bytes = await ReviewService(db).read_document_bytes(document_id, current_user)
     text = _extract_text(doc_bytes, filename)
     page_count = _extract_page_count(doc_bytes, filename)
     return {"document_id": document_id, "filename": filename, "text": text, "page_count": page_count}
@@ -860,7 +369,7 @@ async def get_document_numbering(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    filename, doc_bytes = await _read_document_bytes(db, document_id, current_user)
+    filename, doc_bytes = await ReviewService(db).read_document_bytes(document_id, current_user)
     items = await asyncio.to_thread(_extract_docx_numbered_items, doc_bytes, filename)
     return {
         "document_id": document_id,
@@ -913,7 +422,7 @@ async def suggest_checklist(
     if content_row and content_row.raw_text:
         doc_text = _sample_doc_text(content_row.raw_text)
     else:
-        doc_name, doc_bytes = await _read_document_bytes(db, body.document_id, current_user)
+        doc_name, doc_bytes = await ReviewService(db).read_document_bytes(body.document_id, current_user)
         doc_text = _sample_doc_text(_extract_text(doc_bytes, doc_name))
 
     catalog = _get_catalog(body.review_type)
@@ -932,7 +441,7 @@ async def suggest_checklist(
         "Chọn 4-8 IDs phù hợp nhất. Không chọn các mục rõ ràng không liên quan."
     )
 
-    data = await _call_llm(prompt, db)
+    data = await ReviewService(db).call_llm(prompt)
     ids = [str(i) for i in (data.get("suggested_ids") or []) if str(i) in catalog]
     return SuggestChecklistResponse(suggested_ids=ids)
 
@@ -953,14 +462,14 @@ async def quick_action(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    row = await _load_job(db, body.job_id, current_user.id)
+    row = await ReviewService(db).load_job(body.job_id, current_user.id)
     report_data = dict(row.report or {})
 
     # Trích xuất outline để phục vụ gán nhãn chính xác
     doc_outline = None
     if row.document_id:
         try:
-            _, doc_bytes = await _read_document_bytes(db, str(row.document_id), current_user)
+            _, doc_bytes = await ReviewService(db).read_document_bytes(str(row.document_id), current_user)
             doc_outline = await asyncio.to_thread(_extract_docx_outline, doc_bytes, row.document_name)
         except Exception:
             pass
@@ -972,7 +481,7 @@ async def quick_action(
             if 'doc_bytes' in locals():
                 doc_text_for_action = _extract_text(doc_bytes, row.document_name)[:_MAX_DOC_CHARS]
             else:
-                _, doc_bytes_alt = await _read_document_bytes(db, str(row.document_id), current_user)
+                _, doc_bytes_alt = await ReviewService(db).read_document_bytes(str(row.document_id), current_user)
                 doc_text_for_action = _extract_text(doc_bytes_alt, row.document_name)[:_MAX_DOC_CHARS]
         except Exception:
             pass
@@ -1101,7 +610,7 @@ Return valid JSON only:
 {bilingual_rules_extra}
 """
 
-    data = await _call_llm(prompt, db)
+    data = await ReviewService(db).call_llm(prompt)
 
     raw_edits = data.get("suggested_edits") or []
     suggested_edits: list[dict] = []
@@ -1183,7 +692,7 @@ async def recalculate_score(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     # dict() tạo bản sao mới — cần thiết vì JSONB không track in-place mutation
     report_data = dict(row.report or {})
 
@@ -1257,7 +766,7 @@ async def save_version(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> VersionResponse:
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
 
     merged_result = dict(body.result)
     if body.applied_edits:
@@ -1316,7 +825,7 @@ async def get_versions(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ) -> list[VersionResponse]:
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
 
     stmt = (
         select(ReviewJobVersion)
@@ -1384,7 +893,7 @@ async def delete_history_item(
 ):
     from datetime import timezone as tz
 
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     row.deleted_at = datetime.now(tz.utc)
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
@@ -1398,7 +907,7 @@ async def update_review_status(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     row.status = body.status
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
@@ -1412,7 +921,7 @@ async def save_session_events(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_db),
 ):
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     row.session_events = [e.model_dump() for e in body.events]
     # Phase 3: commit ở boundary (get_db).
     await db.flush()
@@ -1435,7 +944,7 @@ async def download_tracked_changes(
     """
     import traceback
 
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
     report = row.report  # source of _doc_text (not versioned) + fallback for edits
 
     # Tìm version mới nhất có _appliedEdits.
@@ -1467,7 +976,7 @@ async def download_tracked_changes(
     doc_text = ""
     orig_doc_bytes: bytes = b""
     try:
-        _, orig_doc_bytes = await _read_document_bytes(db, str(row.document_id), current_user)
+        _, orig_doc_bytes = await ReviewService(db).read_document_bytes(str(row.document_id), current_user)
         # _doc_text từ row.report (không versioned) — đảm bảo Path B dùng ĐÚNG text LLM đã thấy
         doc_text = report.get("_doc_text") or _extract_text(orig_doc_bytes, row.document_name)
     except Exception:
@@ -1525,7 +1034,7 @@ async def download_eval_report_pdf(
     """
     import httpx
 
-    row = await _load_job(db, job_id, current_user.id)
+    row = await ReviewService(db).load_job(job_id, current_user.id)
 
     doc_stem = Path(row.document_name).stem
     fname_pdf_ascii    = f"{_slugify(doc_stem)}.pdf"

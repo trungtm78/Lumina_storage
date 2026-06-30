@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.api.v1.routes.review import _call_llm
 from src.models.core import AIModelConfig
+from src.services.review_service import ReviewService
 
 pytestmark = pytest.mark.asyncio
 
@@ -23,7 +23,7 @@ async def test_review_call_llm_keeps_deterministic_params(db_session):
 
     fake = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"x": 1}'))])
     with patch("litellm.acompletion", new=AsyncMock(return_value=fake)) as m:
-        out = await _call_llm("hello", db_session)
+        out = await ReviewService(db_session).call_llm("hello")
 
     assert out == {"x": 1}
     kw = m.call_args.kwargs

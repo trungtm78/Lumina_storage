@@ -13,6 +13,7 @@ import math
 import re
 import zipfile
 from io import BytesIO
+from typing import Literal
 from urllib.parse import quote as _urlquote
 
 from src.core.config import get_settings
