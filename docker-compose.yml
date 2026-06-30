@@ -206,6 +206,8 @@ services:
       - ./lumina-storage-backend/main.py:/app/main.py:ro
       # pyproject mount live → import-linter [tool.importlinter] config đổi không cần rebuild.
       - ./lumina-storage-backend/pyproject.toml:/app/pyproject.toml:ro
+      # scripts mount live → test + chạy management script (reingest_nfc) không cần rebuild.
+      - ./lumina-storage-backend/scripts:/app/scripts:ro
     depends_on:
       postgres:
         condition: service_healthy
