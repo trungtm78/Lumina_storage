@@ -10,6 +10,7 @@ Tools: read_file, write_file, list_directory, search_files,
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import json
 import uuid
@@ -30,6 +31,8 @@ from src.services.vector_service import SearchResult, VectorService
 from src.services.skill_service import SkillContext, SkillService
 from src.services.document_permission import DocumentPermissionService
 from src.repositories.document import DocumentRepository
+
+logger = logging.getLogger(__name__)
 
 # ── Deps ───────────────────────────────────────────────────────────────
 
@@ -252,6 +255,8 @@ async def write_file(
 
         return json.dumps({"document_id": str(doc_id), "filename": filename})
     except Exception as e:
+        # Tool-boundary isolation: trả lỗi cho agent (KHÔNG crash stream), nhưng LOG để debug.
+        logger.error("write_file thất bại (filename=%s): %s", filename, e, exc_info=True)
         return json.dumps({"error": str(e)})
 
 
@@ -442,8 +447,9 @@ async def run_script(
                         model_api_base = mc.base_url
                         model_api_version = (mc.extra_config or {}).get("api_version")
                         admin_configured = True
-        except Exception:
-            pass  # Fall through to chat model / default
+        except Exception as e:
+            # GIỮ catch BROAD (tránh crash mới) nhưng LOG thay vì nuốt im → fall-through chat/default.
+            logger.warning("Đọc skill_model_config (skill=%s) lỗi: %s", skill_name, e, exc_info=True)
 
     # If admin didn't configure a specific model, check if vendor specified one in config.json
     if skill_name and not admin_configured:
@@ -458,8 +464,8 @@ async def run_script(
                     from src.services.ai_model_config_service import build_litellm_model
                     model_override = build_litellm_model(vendor_provider, vendor_model)
                     # API key stays as-is (uses Storage's configured key for that provider)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Đọc vendor config.json (skill=%s) lỗi: %s", skill_name, e, exc_info=True)
 
     # Load app config (decrypted) for this skill
     app_config: dict = {}
@@ -468,8 +474,8 @@ async def run_script(
             from src.services.app_config_service import AppConfigService
             app_cfg_svc = AppConfigService(deps.db, deps.settings)
             app_config = await app_cfg_svc.get_decrypted_config(skill_name)
-        except Exception:
-            pass  # Fall through with empty config
+        except Exception as e:
+            logger.warning("Đọc app_config (skill=%s) lỗi: %s — dùng config rỗng", skill_name, e, exc_info=True)
 
     skill_ctx = SkillContext(
         db=deps.db, settings=deps.settings, user=deps.user,
