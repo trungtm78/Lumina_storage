@@ -1,0 +1,1 @@
+"""Domain: document (Phase 8 W3) — document/folder/thumbnail/text_chunking/text_extraction/reference_loader + routes documents/folders/upload/tasks. document_permission ĐÃ shared. LƯU Ý: text_extraction_service dùng bởi extraction infra (finalize: cân nhắc shared)."""

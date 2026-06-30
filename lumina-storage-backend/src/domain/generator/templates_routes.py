@@ -461,7 +461,7 @@ async def extract_template_from_document(
 ):
     """Manually trigger template extraction from an existing document."""
     from fastapi import HTTPException
-    from src.api.v1.routes.documents import get_arq_pool
+    from src.api.deps import get_arq_pool
     from src.worker.dispatch import dispatch_task
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -515,7 +515,7 @@ async def extract_template_draft_endpoint(
     POST /templates/{document_id}/commit.
     """
     from fastapi import HTTPException
-    from src.api.v1.routes.documents import get_arq_pool
+    from src.api.deps import get_arq_pool
     from src.worker.dispatch import dispatch_task
     from sqlalchemy.orm.attributes import flag_modified
 
