@@ -131,6 +131,46 @@ class DocumentService:
 
         return results
 
+    async def create_from_bytes(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        owner: User,
+        folder_id: uuid.UUID | None = None,
+        mime_type: str | None = None,
+        source_type: str = "skill_generated",
+    ) -> DocumentResponse:
+        """Tạo Document từ bytes (skill/agent write_file). KHÔNG commit (boundary caller).
+
+        ACL: chỉ kiểm tra quyền khi có folder_id (write_file hiện ghi ở root → không đổi
+        hành vi). Storage qua _resolve_storage (get_default) — nhất quán với upload thật.
+        """
+        if folder_id:
+            folder = await self.folder_repo.get_by_id_active(folder_id)
+            if not folder:
+                raise NotFoundError("Folder not found")
+            await self.perm_svc.check_permission(owner, folder_id=folder_id, required="editor")
+
+        storage_config, backend = await self._resolve_storage(None, owner)
+        storage_result = await backend.save(data, filename)
+
+        doc = await self.doc_repo.create({
+            "title": Path(filename).stem,
+            "file_name": storage_result.file_name,
+            "original_filename": filename,
+            "file_path": storage_result.file_path,
+            "file_size": storage_result.file_size,
+            "mime_type": mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            "extension": Path(filename).suffix.lower(),
+            "checksum": storage_result.checksum,
+            "folder_id": folder_id,
+            "storage_config_id": storage_config.id,
+            "owner_id": owner.id,
+            "source_type": source_type,
+        })
+        return DocumentResponse.model_validate(doc)
+
     async def upload_folder(
         self,
         files: list[UploadFile],

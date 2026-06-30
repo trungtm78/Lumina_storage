@@ -21,7 +21,6 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Settings
@@ -240,39 +239,16 @@ async def write_file(
         if source_document_id:
             doc_id = await skill_ctx.save_rendered_document(data, source_document_id, filename_suffix="")
         else:
-            from src.models.document import Document
-            from src.services.storage import get_storage_backend
-            from src.models.storage import StorageConfig
-
-            result = await deps.db.execute(sa_text("SELECT id FROM storage_storageconfig LIMIT 1"))
-            row = result.fetchone()
-            if not row:
-                return json.dumps({"error": "No storage config found"})
-
-            storage_cfg = await deps.db.get(StorageConfig, row[0])
-            backend = get_storage_backend(storage_cfg)
-            save_result = await backend.save(data, filename)
-
-            ext = Path(filename).suffix.lstrip(".")
-            new_doc = Document(
-                title=Path(filename).stem,
-                file_name=save_result.file_name,
-                original_filename=filename,
-                file_path=save_result.file_path,
-                file_size=save_result.file_size,
-                mime_type="text/plain",
-                extension=ext,
-                checksum=save_result.checksum,
-                storage_config_id=storage_cfg.id,
-                owner_id=deps.user.id,
+            # Phase 7: tạo Document qua DocumentService (ACL + storage nhất quán với upload).
+            from src.services.document import DocumentService
+            doc = await DocumentService(deps.db).create_from_bytes(
+                data=data, filename=filename, owner=deps.user,
+                mime_type="text/plain", source_type="skill_generated",
             )
-            deps.db.add(new_doc)
-            await deps.db.flush()
-            await deps.db.refresh(new_doc)
             # Phase 3 — COMMIT CỐ Ý: tool save_document phải bền NGAY (side-effect độc
             # lập), không bị rollback nếu bước agent sau trong cùng stream lỗi. Boundary cố ý.
             await deps.db.commit()
-            doc_id = new_doc.id
+            doc_id = doc.id
 
         return json.dumps({"document_id": str(doc_id), "filename": filename})
     except Exception as e:
