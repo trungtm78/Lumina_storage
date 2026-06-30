@@ -12,18 +12,27 @@ from pathlib import Path
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import get_settings
 from src.models.document import Document
 from src.models.generator import GeneratorSession, GeneratorSessionVersion
 from src.repositories.generator import (
     GeneratorSessionRepository,
     GeneratorSessionVersionRepository,
 )
-from src.schemas.generator import BlockEditOp
+from src.schemas.generator import BlockEditOp, GeneratorSessionGenerateRequest
 from src.services.generator_docx import (
+    _apply_html_edits_to_docx,
     _iter_all_paragraphs,
     _merge_runs,
     _replace_in_runs,
     _validate_field_values,
+)
+from src.services.generator_html import (
+    _html_to_docx_bytes,
+    _html_to_docx_via_gotenberg,
+    _html_to_pdf_bytes,
+    _substitute_fields_html,
+    _wrap_html_document,
 )
 from src.services.storage import get_storage_backend
 
@@ -196,6 +205,242 @@ class GeneratorService:
                     continue
                 raise HTTPException(422, "AI không trả về kết quả hợp lệ. Vui lòng thử lại.")
         return [], warnings
+
+    async def generate_from_session(
+        self,
+        session_id: uuid.UUID,
+        body: GeneratorSessionGenerateRequest,
+        current_user_id: uuid.UUID,
+    ) -> GeneratorSession:
+        """Sinh tài liệu từ một session (nhánh sửa-tay HTML hoặc nhánh template).
+
+        Trả về GeneratorSession đã cập nhật status (caller route model_validate).
+        Commit status-machine TƯỜNG MINH bên trong (COMMIT CỐ Ý Phase 3) — nhánh
+        except ghi status="failed" RỒI commit TRƯỚC `raise` để bền qua rollback boundary.
+        """
+        db = self._session
+        session = await self.get_session_for_user(session_id, current_user_id)
+        if session is None:
+            raise HTTPException(404, "Session not found")
+        _has_edit = bool(body.version_id or body.edited_html or session.edited_html)
+        if session.template_id is None and not _has_edit:
+            raise HTTPException(400, "Session has no template_id — cannot generate")
+
+        want_pdf = (body.output_format or "docx").lower() == "pdf"
+        # Folder: explicit request wins, else fall back to the folder saved on the draft.
+        target_folder_id = body.folder_id or session.folder_id
+
+        # ── Resolve nội dung SỬA TAY (nếu có): version_id > body.edited_html > session.edited_html ──
+        edited_html = None
+        edited_fv = session.field_values or {}
+        if body.version_id:
+            ver = await self.get_version_for_session(body.version_id, session_id)
+            if ver is None:
+                raise HTTPException(404, "Version not found")
+            edited_html = ver.edited_html
+            edited_fv = ver.field_values or edited_fv
+        elif body.edited_html is not None:
+            edited_html = body.edited_html
+        elif session.edited_html:
+            edited_html = session.edited_html
+
+        # ── NHÁNH SỬA TAY ────────────────────────────────────────────────────────────
+        # Khi có edited_html VÀ template_id: patch DOCX gốc (giữ formatting hoàn toàn)
+        # Khi chỉ có edited_html (không có template): fallback HTML→DOCX (lossy)
+        if edited_html:
+            try:
+                from sqlalchemy import select as _sa_select
+                from src.models.storage import StorageConfig
+
+                _cfg = (
+                    await db.execute(_sa_select(StorageConfig).where(StorageConfig.is_default.is_(True)).limit(1))
+                ).scalar_one_or_none()
+                if _cfg is None:
+                    _cfg = (await db.execute(_sa_select(StorageConfig).limit(1))).scalar_one_or_none()
+                if _cfg is None:
+                    raise HTTPException(500, "No storage configuration available")
+                backend = get_storage_backend(_cfg)
+
+                base_name = Path(body.output_filename).stem if body.output_filename else (session.title or "tai_lieu")
+                settings = get_settings()
+
+                if session.template_id is not None:
+                    # ── Đường chính: patch DOCX gốc, giữ toàn bộ formatting ──────────
+                    # _apply_html_edits_to_docx dùng difflib để tìm paragraph thay đổi,
+                    # thay text trong DOCX runs (giữ bold/italic/font/size/màu) — không
+                    # convert HTML→DOCX, không mất style gốc.
+                    from src.models.document import Document as DocModel
+                    template_doc = await db.get(DocModel, session.template_id)
+                    if template_doc is None or template_doc.deleted_at is not None:
+                        raise HTTPException(404, "Template not found")
+                    tmpl_storage_cfg = await db.get(StorageConfig, template_doc.storage_config_id)
+                    tmpl_backend = get_storage_backend(tmpl_storage_cfg)
+                    template_bytes = await tmpl_backend.read(template_doc.file_path)
+
+                    docx_bytes = _apply_html_edits_to_docx(template_bytes, edited_html, edited_fv)
+
+                    if want_pdf:
+                        if not settings.gotenberg_url:
+                            raise HTTPException(503, "PDF conversion unavailable — Gotenberg not configured")
+                        async with __import__("httpx").AsyncClient(timeout=120) as client:
+                            resp = await client.post(
+                                f"{settings.gotenberg_url}/forms/libreoffice/convert",
+                                files={"files": (f"{base_name}.docx", docx_bytes,
+                                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+                            )
+                        if resp.status_code != 200:
+                            raise HTTPException(502, "DOCX→PDF conversion failed")
+                        file_bytes = resp.content
+                        filename, mime, ext = f"{base_name}.pdf", "application/pdf", "pdf"
+                    else:
+                        file_bytes = docx_bytes
+                        filename = f"{base_name}.docx"
+                        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        ext = "docx"
+
+                else:
+                    # ── Fallback: không có template, convert HTML→DOCX (lossy) ────────
+                    substituted = _substitute_fields_html(edited_html, edited_fv)
+                    if want_pdf:
+                        if not settings.gotenberg_url:
+                            raise HTTPException(503, "PDF conversion unavailable — Gotenberg not configured")
+                        file_bytes = await _html_to_pdf_bytes(_wrap_html_document(substituted), settings.gotenberg_url)
+                        filename, mime, ext = f"{base_name}.pdf", "application/pdf", "pdf"
+                    else:
+                        if settings.gotenberg_url:
+                            file_bytes = await _html_to_docx_via_gotenberg(
+                                _wrap_html_document(substituted), settings.gotenberg_url
+                            )
+                        else:
+                            file_bytes = _html_to_docx_bytes(substituted)
+                        filename = f"{base_name}.docx"
+                        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        ext = "docx"
+
+                save_result = await backend.save(file_bytes, filename)
+                doc = Document(
+                    title=base_name,
+                    file_name=save_result.file_name,
+                    original_filename=filename,
+                    file_path=save_result.file_path,
+                    file_size=save_result.file_size,
+                    mime_type=mime,
+                    extension=ext,
+                    checksum=save_result.checksum,
+                    storage_config_id=_cfg.id,
+                    owner_id=current_user_id,
+                    folder_id=target_folder_id,
+                    source_type="generated",
+                    source_metadata={
+                        "template_id": str(session.template_id) if session.template_id else None,
+                        "from_manual_edit": True,
+                    },
+                )
+                db.add(doc)
+                await db.flush()
+                await db.refresh(doc)
+                session = await self.update_session(session_id, {
+                    "status": "completed",
+                    "document_id": doc.id,
+                    "folder_id": target_folder_id,
+                    "edited_html": edited_html,
+                })
+                # Phase 3 — COMMIT CỐ Ý (status-machine): persist trạng thái completed/failed
+                # của session. Nhánh except ghi status="failed" RỒI commit TRƯỚC `raise` →
+                # phải bền qua rollback của boundary. KHÔNG gỡ.
+                await db.commit()
+            except HTTPException:
+                await self.update_session(session_id, {"status": "failed", "error_message": "Manual-edit generation failed"})
+                await db.commit()
+                raise
+            return session
+
+        try:
+            rendered_doc, out_filename, _count = await self.execute_generate(
+                template_id=session.template_id,
+                field_values=session.field_values or {},
+                output_filename=body.output_filename,
+                folder_id=target_folder_id,
+                owner_id=current_user_id,
+                skip_field_validation=body.skip_field_validation,
+            )
+
+            final_document_id = rendered_doc.id
+
+            # Convert to PDF via Gotenberg if requested
+            if want_pdf:
+                settings = get_settings()
+                if not settings.gotenberg_url:
+                    raise HTTPException(503, "PDF conversion unavailable — Gotenberg not configured")
+                try:
+                    import httpx
+                    from pathlib import Path as _Path
+                    from src.models.storage import StorageConfig
+                    from src.services.storage import get_storage_backend as _get_backend
+
+                    storage_cfg = await db.get(StorageConfig, rendered_doc.storage_config_id)
+                    backend = _get_backend(storage_cfg)
+                    docx_bytes = await backend.read(rendered_doc.file_path)
+
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        resp = await client.post(
+                            f"{settings.gotenberg_url}/forms/libreoffice/convert",
+                            files={"files": (out_filename, docx_bytes, rendered_doc.mime_type)},
+                        )
+                    if resp.status_code != 200:
+                        raise HTTPException(502, "PDF conversion failed")
+
+                    pdf_bytes = resp.content
+                    src_stem = _Path(out_filename).stem
+                    pdf_filename = body.output_filename.replace(".docx", ".pdf") if body.output_filename else f"{src_stem}.pdf"
+                    pdf_result = await backend.save(pdf_bytes, pdf_filename)
+
+                    pdf_doc = Document(
+                        title=rendered_doc.title.replace(".docx", ".pdf") if ".docx" in rendered_doc.title else rendered_doc.title,
+                        description=rendered_doc.description,
+                        file_name=pdf_result.file_name,
+                        original_filename=pdf_filename,
+                        file_path=pdf_result.file_path,
+                        file_size=pdf_result.file_size,
+                        mime_type="application/pdf",
+                        extension="pdf",
+                        checksum=pdf_result.checksum,
+                        storage_config_id=rendered_doc.storage_config_id,
+                        owner_id=current_user_id,
+                        folder_id=rendered_doc.folder_id,
+                        source_type="generated",
+                        source_metadata={
+                            **(rendered_doc.source_metadata or {}),
+                            "converted_from_docx_id": str(rendered_doc.id),
+                        },
+                    )
+                    db.add(pdf_doc)
+                    await db.flush()
+                    await db.refresh(pdf_doc)
+
+                    # Remove the intermediate DOCX (keep only PDF)
+                    rendered_doc.deleted_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                    final_document_id = pdf_doc.id
+
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(502, f"PDF conversion error: {e}") from e
+
+            session = await self.update_session(session_id, {
+                "status": "completed",
+                "document_id": final_document_id,
+                "folder_id": target_folder_id,
+            })
+            # Phase 3 — COMMIT CỐ Ý (status-machine): nhánh except ghi status="failed" RỒI
+            # commit TRƯỚC `raise` → phải bền qua rollback của boundary. KHÔNG gỡ.
+            await db.commit()
+        except HTTPException:
+            await self.update_session(session_id, {"status": "failed", "error_message": "Generation failed"})
+            await db.commit()
+            raise
+
+        return session
 
     # ── Session ──────────────────────────────────────────────────────────────
     async def create_session(self, data: dict) -> GeneratorSession:
