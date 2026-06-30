@@ -1,4 +1,4 @@
-import asyncio
+from src.core.background import spawn_background
 import json
 import logging
 import uuid
@@ -531,9 +531,11 @@ class ChatService:
         # Phase 4 T4: fire-and-forget flush (KHÔNG block response).
         fire_and_forget_flush(langfuse_handler)
 
-        # 14. Auto-generate title — fire-and-forget so stream closes immediately
+        # 14. Auto-generate title — fire-and-forget so stream closes immediately.
+        # spawn_background GIỮ ref → tránh asyncio GC huỷ task title giữa chừng (ARCH-P2).
         session = await self.db.get(ChatSession, session_id)
         if session and not session.title:
-            asyncio.create_task(
-                generate_title_background(session_id, user_message, assistant_content, self.settings)
+            spawn_background(
+                generate_title_background(session_id, user_message, assistant_content, self.settings),
+                name="chat-title",
             )

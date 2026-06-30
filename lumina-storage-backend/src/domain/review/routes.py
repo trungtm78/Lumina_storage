@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser
+from src.core.background import spawn_background
 from src.core.config import get_settings
 from src.core.database import get_db
 from src.core.uow import uow_context
@@ -221,7 +222,8 @@ async def start_review(
         except Exception:
             _log.warning("persist_eval_pdf background failed for job %s", _pdf_job_id, exc_info=True)
 
-    asyncio.create_task(_persist_pdf_bg())
+    # spawn_background GIỮ ref → tránh asyncio GC huỷ task pre-gen PDF giữa chừng (ARCH-P2).
+    spawn_background(_persist_pdf_bg(), name="review-pdf")
 
     return {
         "job_id": job_id,
