@@ -8,7 +8,7 @@
 import uuid
 
 import src.services.agent as agent_mod
-from src.services.chat_service import citation_to_source, citations_to_sources
+from src.services.citation_service import citation_to_source, citations_to_sources
 
 
 def test_query_vector_db_removed():
