@@ -8,13 +8,16 @@ Import helper từ review_helpers + model từ schemas.review → KHÔNG vi ph�
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import get_settings
 from src.models.document import Document
 from src.models.review import ReviewJob
 from src.models.user import User
@@ -31,6 +34,7 @@ from src.schemas.review import (
     RiskBreakdownItem,
 )
 from src.services.document_permission import DocumentPermissionService
+from src.services.review_export import build_legal_eval_html
 from src.services.review_helpers import (
     _KEY_INFO_GROUPS,
     _MAX_DOC_CHARS,
@@ -41,16 +45,22 @@ from src.services.review_helpers import (
     _clamp_score,
     _clean_edit_text,
     _detect_bilingual,
+    _dict_list,
+    _edits_from_report,
     _extract_text,
     _find_best_verbatim_match,
     _find_clause_label,
     _normalize_ws,
     _parse_edit_type,
     _safe_json_loads,
+    _slugify,
+    _str_list,
     _SYSTEM_REVIEW_PROMPT,
     _verbatim_confidence,
 )
 from src.services.storage import get_storage_backend
+
+_log = logging.getLogger(__name__)
 
 async def _read_document_bytes(
     db: AsyncSession,
@@ -530,3 +540,117 @@ class ReviewService:
 
     async def load_job(self, job_id: str, user_id: uuid.UUID) -> ReviewJob:
         return await _load_job(self._session, job_id, user_id)
+
+    async def persist_eval_pdf(
+        self,
+        job_id: uuid.UUID,
+        *,
+        pdf_bytes: bytes | None = None,
+        applied_edits: dict | None = None,
+        version_label: str | None = None,
+    ) -> None:
+        """Store eval-report PDF và gắn vào job (best-effort).
+
+        Phase 8 B3 — sửa latent bug session-reuse: nhận `job_id` (KHÔNG ORM object gắn
+        session khác), đọc lại ReviewJob trong self._session. **KHÔNG tự commit, KHÔNG
+        nuốt exception** — CALLER bọc `async with uow_context() as uow:` (session RIÊNG,
+        commit/rollback boundary) + try/except NGOÀI cho best-effort/log. Nhờ vậy cả
+        background task (start_review) lẫn download path KHÔNG poison/đụng request session.
+        Skip GRACEFUL (return) khi thiếu gotenberg/cfg/job — đó KHÔNG phải lỗi.
+
+        Nếu pdf_bytes được cung cấp → lưu trực tiếp, không gọi Gotenberg.
+        Nếu không → tự generate HTML → Gotenberg → lưu (pre-generate path).
+        """
+        db = self._session
+        settings = get_settings()
+        if pdf_bytes is None and not settings.gotenberg_url:
+            return
+        job_row = await db.get(ReviewJob, job_id)
+        if job_row is None:
+            return
+
+        from sqlalchemy import select as _sa_select
+        from src.models.storage import StorageConfig
+
+        cfg = None
+        if job_row.document_id:
+            doc = (await db.execute(
+                _sa_select(Document).where(Document.id == job_row.document_id)
+            )).scalar_one_or_none()
+            if doc:
+                cfg = await db.get(StorageConfig, doc.storage_config_id)
+        if cfg is None:
+            cfg = (await db.execute(
+                _sa_select(StorageConfig).where(StorageConfig.is_default.is_(True)).limit(1)
+            )).scalar_one_or_none()
+        if cfg is None:
+            cfg = (await db.execute(_sa_select(StorageConfig).limit(1))).scalar_one_or_none()
+        if cfg is None:
+            return
+
+        if pdf_bytes is None:
+            # Generate HTML rồi gọi Gotenberg (pre-generate path sau khi review xong)
+            report = job_row.report
+            cmp_raw = report.get("comparison")
+            html = build_legal_eval_html(
+                document_name=job_row.document_name,
+                review_type=job_row.review_type,
+                risk_score=job_row.risk_score,
+                summary=str(report.get("summary", "")),
+                risk_explanation=str(report.get("riskExplanation", "")),
+                key_information=_dict_list(report, "keyInformation"),
+                checklist=_dict_list(report, "checklist"),
+                highlights=_dict_list(report, "highlights"),
+                key_issues=_str_list(report, "keyIssues"),
+                missing_items=_str_list(report, "missingItems"),
+                detected_errors=_str_list(report, "detectedErrors"),
+                edits=_edits_from_report(report),
+                comparison=dict(cmp_raw) if isinstance(cmp_raw, dict) else None,
+                reference_results=_dict_list(report, "referenceResults"),
+                suggestions=_str_list(report, "suggestions"),
+                risk_factors=_str_list(report, "riskFactors"),
+                risk_breakdown=_dict_list(report, "riskBreakdown"),
+                compare_mode=job_row.compare_mode,
+                applied_edits=applied_edits,
+                version_label=version_label,
+            )
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{settings.gotenberg_url}/forms/chromium/convert/html",
+                    files={"files": ("index.html", html.encode("utf-8"), "text/html")},
+                    data={"paperFormat": "A4"},
+                )
+            if resp.status_code != 200:
+                _log.warning(
+                    "persist_eval_pdf: Gotenberg returned %s for job %s", resp.status_code, job_row.id
+                )
+                return
+            pdf_bytes = resp.content
+
+        doc_stem = Path(job_row.document_name).stem
+        pdf_filename = f"{_slugify(doc_stem)}_eval.pdf"
+        backend = get_storage_backend(cfg)
+        result = await backend.save(pdf_bytes, pdf_filename)
+
+        pdf_doc = Document(
+            title=f"{doc_stem}_eval",
+            file_name=result.file_name,
+            original_filename=pdf_filename,
+            file_path=result.file_path,
+            file_size=result.file_size,
+            mime_type="application/pdf",
+            extension="pdf",
+            checksum=result.checksum,
+            storage_config_id=cfg.id,
+            owner_id=job_row.user_id,
+            source_type="skill_temp",
+            source_metadata={"review_job_id": str(job_row.id)},
+        )
+        db.add(pdf_doc)
+        await db.flush()
+        await db.refresh(pdf_doc)
+        job_row.pdf_document_id = pdf_doc.id
+        # KHÔNG commit ở đây — uow_context của caller sở hữu boundary (commit khi sạch /
+        # rollback khi lỗi). KHÔNG try/except nuốt — để exception lan tới uow + caller.
+        _log.info("persist_eval_pdf: stored PDF %s for job %s", pdf_doc.id, job_row.id)

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser
 from src.core.config import get_settings
 from src.core.database import get_db
+from src.core.uow import uow_context
 from src.models.document import Document
 from src.models.review import ReviewJob, ReviewJobVersion
 from src.services.review_export import (
@@ -83,113 +84,6 @@ from src.services.review_helpers import (
 
 from src.services.review_service import ReviewService
 
-# ─── PDF pre-generation (fire-and-forget) ────────────────────────────────────
-
-async def _persist_eval_pdf(
-    job_row: ReviewJob,
-    db: AsyncSession,
-    *,
-    pdf_bytes: bytes | None = None,
-    applied_edits: dict | None = None,
-    version_label: str | None = None,
-) -> None:
-    """Store eval-report PDF và gắn vào job (best-effort).
-
-    Nếu pdf_bytes được cung cấp → lưu trực tiếp, không gọi Gotenberg.
-    Nếu không → tự generate HTML → Gotenberg → lưu (pre-generate path).
-    """
-    settings = get_settings()
-    if pdf_bytes is None and not settings.gotenberg_url:
-        return
-    try:
-        from sqlalchemy import select as _sa_select
-        from src.models.storage import StorageConfig
-
-        cfg = None
-        if job_row.document_id:
-            doc = (await db.execute(
-                _sa_select(Document).where(Document.id == job_row.document_id)
-            )).scalar_one_or_none()
-            if doc:
-                cfg = await db.get(StorageConfig, doc.storage_config_id)
-        if cfg is None:
-            cfg = (await db.execute(
-                _sa_select(StorageConfig).where(StorageConfig.is_default.is_(True)).limit(1)
-            )).scalar_one_or_none()
-        if cfg is None:
-            cfg = (await db.execute(_sa_select(StorageConfig).limit(1))).scalar_one_or_none()
-        if cfg is None:
-            return
-
-        if pdf_bytes is None:
-            # Generate HTML rồi gọi Gotenberg (pre-generate path sau khi review xong)
-            report = job_row.report
-            cmp_raw = report.get("comparison")
-            html = build_legal_eval_html(
-                document_name=job_row.document_name,
-                review_type=job_row.review_type,
-                risk_score=job_row.risk_score,
-                summary=str(report.get("summary", "")),
-                risk_explanation=str(report.get("riskExplanation", "")),
-                key_information=_dict_list(report, "keyInformation"),
-                checklist=_dict_list(report, "checklist"),
-                highlights=_dict_list(report, "highlights"),
-                key_issues=_str_list(report, "keyIssues"),
-                missing_items=_str_list(report, "missingItems"),
-                detected_errors=_str_list(report, "detectedErrors"),
-                edits=_edits_from_report(report),
-                comparison=dict(cmp_raw) if isinstance(cmp_raw, dict) else None,
-                reference_results=_dict_list(report, "referenceResults"),
-                suggestions=_str_list(report, "suggestions"),
-                risk_factors=_str_list(report, "riskFactors"),
-                risk_breakdown=_dict_list(report, "riskBreakdown"),
-                compare_mode=job_row.compare_mode,
-                applied_edits=applied_edits,
-                version_label=version_label,
-            )
-            import httpx as _httpx
-            async with _httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{settings.gotenberg_url}/forms/chromium/convert/html",
-                    files={"files": ("index.html", html.encode("utf-8"), "text/html")},
-                    data={"paperFormat": "A4"},
-                )
-            if resp.status_code != 200:
-                _log.warning(
-                    "_persist_eval_pdf: Gotenberg returned %s for job %s", resp.status_code, job_row.id
-                )
-                return
-            pdf_bytes = resp.content
-
-        doc_stem = Path(job_row.document_name).stem
-        pdf_filename = f"{_slugify(doc_stem)}_eval.pdf"
-        backend = get_storage_backend(cfg)
-        result = await backend.save(pdf_bytes, pdf_filename)
-
-        pdf_doc = Document(
-            title=f"{doc_stem}_eval",
-            file_name=result.file_name,
-            original_filename=pdf_filename,
-            file_path=result.file_path,
-            file_size=result.file_size,
-            mime_type="application/pdf",
-            extension="pdf",
-            checksum=result.checksum,
-            storage_config_id=cfg.id,
-            owner_id=job_row.user_id,
-            source_type="skill_temp",
-            source_metadata={"review_job_id": str(job_row.id)},
-        )
-        db.add(pdf_doc)
-        await db.flush()
-        await db.refresh(pdf_doc)
-        job_row.pdf_document_id = pdf_doc.id
-        # Phase 3 — COMMIT CỐ Ý: _persist_eval_pdf chạy trong asyncio background (ngoài
-        # request boundary) → phải tự commit. KHÔNG gỡ.
-        await db.commit()
-        _log.info("_persist_eval_pdf: stored PDF %s for job %s", pdf_doc.id, job_row.id)
-    except Exception:
-        _log.warning("_persist_eval_pdf: failed for job %s", job_row.id, exc_info=True)
 
 
 # ─── Job loader ───────────────────────────────────────────────────────────────
@@ -314,8 +208,20 @@ async def start_review(
     # _persist_eval_pdf (asyncio background đọc job_row + ghi pdf). KHÔNG gỡ.
     await db.commit()
 
-    # 9. Fire-and-forget PDF pre-generation (không block response)
-    asyncio.create_task(_persist_eval_pdf(job_row, db))
+    # 9. Fire-and-forget PDF pre-generation (không block response).
+    #    Phase 8 B3 — sửa latent bug session-reuse: background task dùng session RIÊNG
+    #    qua uow_context (KHÔNG tái dùng request `db` đã commit+đóng sau response). Truyền
+    #    job_id (KHÔNG ORM object), persist_eval_pdf đọc lại job trong session mới.
+    _pdf_job_id = job_row.id
+
+    async def _persist_pdf_bg() -> None:
+        try:
+            async with uow_context() as uow:
+                await ReviewService(uow.session).persist_eval_pdf(_pdf_job_id)
+        except Exception:
+            _log.warning("persist_eval_pdf background failed for job %s", _pdf_job_id, exc_info=True)
+
+    asyncio.create_task(_persist_pdf_bg())
 
     return {
         "job_id": job_id,
@@ -1128,9 +1034,15 @@ async def download_eval_report_pdf(
             )
         if resp.status_code == 200:
             pdf_content = resp.content
-            # Store for future downloads — pass bytes trực tiếp, không gọi Gotenberg lần 2
+            # Store for future downloads — pass bytes trực tiếp, không gọi Gotenberg lần 2.
+            # Phase 8 B3 — session RIÊNG qua uow_context: best-effort PDF cache KHÔNG poison
+            # request session (tránh poison-tx → 500 cho response PDF đã sẵn sàng).
             try:
-                await _persist_eval_pdf(row, db, pdf_bytes=pdf_content, applied_edits=pdf_applied_edits, version_label=pdf_version_label)
+                async with uow_context() as uow:
+                    await ReviewService(uow.session).persist_eval_pdf(
+                        row.id, pdf_bytes=pdf_content,
+                        applied_edits=pdf_applied_edits, version_label=pdf_version_label,
+                    )
             except Exception:
                 pass
             return Response(
