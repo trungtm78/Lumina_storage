@@ -557,7 +557,7 @@ class TestAPI:
 
     @pytest.mark.asyncio
     async def test_parse_jd(self, async_client: AsyncClient, auth_headers: dict, default_storage_config: StorageConfig):
-        with patch("src.api.v1.routes.candidate_evaluation.SkillService") as Mock:
+        with patch("src.domain.review.candidate_routes.SkillService") as Mock:
             svc = Mock.return_value
             svc.get_by_name.return_value = MagicMock()
             svc.resolve_model = AsyncMock(return_value=("m", "k", "b", "v", None))
@@ -574,7 +574,7 @@ class TestAPI:
 
     @pytest.mark.asyncio
     async def test_match(self, async_client: AsyncClient, auth_headers: dict, default_storage_config: StorageConfig):
-        with patch("src.api.v1.routes.candidate_evaluation.SkillService") as Mock:
+        with patch("src.domain.review.candidate_routes.SkillService") as Mock:
             svc = Mock.return_value
             svc.get_by_name.return_value = MagicMock()
             svc.resolve_model = AsyncMock(return_value=("m", "k", "b", "v", None))
@@ -593,7 +593,7 @@ class TestAPI:
 
     @pytest.mark.asyncio
     async def test_error_propagation(self, async_client: AsyncClient, auth_headers: dict, default_storage_config: StorageConfig):
-        with patch("src.api.v1.routes.candidate_evaluation.SkillService") as Mock:
+        with patch("src.domain.review.candidate_routes.SkillService") as Mock:
             svc = Mock.return_value
             svc.get_by_name.return_value = MagicMock()
             svc.resolve_model = AsyncMock(return_value=("m", "k", "b", "v", None))

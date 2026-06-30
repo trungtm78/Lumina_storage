@@ -56,7 +56,7 @@ async def test_persist_eval_pdf_no_commit_and_persists(db_session, test_user, de
     job = await _make_job(db_session, test_user)
     calls: list = []
     _spy_commit(db_session, calls)
-    with patch("src.services.review_service.get_storage_backend", return_value=_mock_backend()):
+    with patch("src.domain.review.review_service.get_storage_backend", return_value=_mock_backend()):
         await ReviewService(db_session).persist_eval_pdf(job.id, pdf_bytes=b"PDF")
 
     assert job.pdf_document_id is not None
@@ -72,7 +72,7 @@ async def test_persist_eval_pdf_propagates_error_no_swallow(db_session, test_use
     job = await _make_job(db_session, test_user)
     backend = SimpleNamespace()
     backend.save = AsyncMock(side_effect=RuntimeError("storage down"))
-    with patch("src.services.review_service.get_storage_backend", return_value=backend):
+    with patch("src.domain.review.review_service.get_storage_backend", return_value=backend):
         with pytest.raises(RuntimeError):
             await ReviewService(db_session).persist_eval_pdf(job.id, pdf_bytes=b"PDF")
 
