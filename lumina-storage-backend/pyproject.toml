@@ -95,6 +95,12 @@ type = "forbidden"
 source_modules = ["src.services"]
 forbidden_modules = ["src.api"]
 
+# Phase 8 W3 — domain reorg (src/domain/<x>/). Independence contract giữa 8 domain = CONSOLIDATION
+# follow-up: hiện cross-domain đi qua shim ở src/services (transitional) → grimp chưa thấy domain
+# trong graph trực tiếp ("module does not exist"). Sau khi gỡ shim + đưa cross-cutting còn lại
+# (skill/agent/retrieval/text_extraction) sang src/shared → bật independence contract. 2 contract
+# trên (route!->repo, service!->api) vẫn enforce shim + code còn lại ở src/services.
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
