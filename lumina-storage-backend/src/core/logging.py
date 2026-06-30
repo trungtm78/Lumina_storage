@@ -44,3 +44,28 @@ def configure_logging(level: int = logging.INFO, force: bool = False) -> None:
 
 def get_logger(name: str = "app"):
     return structlog.get_logger(name)
+
+
+class _WorkerCorrelationFilter(logging.Filter):
+    """Gắn request_id (từ correlation-id ContextVar) vào mọi LogRecord của worker.
+
+    Worker dùng stdlib logging (không structlog) → processor _add_correlation_id KHÔNG chạy.
+    Filter này đọc ContextVar (worker set từ BackgroundTask.request_id) → log có request_id.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from asgi_correlation_id.context import correlation_id
+        record.request_id = correlation_id.get() or "-"
+        return True
+
+
+def configure_worker_logging(level: int = logging.INFO) -> None:
+    """Cấu hình stdlib logging cho worker với request_id (Phase 8 T3)."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s [req=%(request_id)s]: %(message)s")
+    )
+    handler.addFilter(_WorkerCorrelationFilter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level)

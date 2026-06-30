@@ -44,6 +44,9 @@ class BackgroundTask(Base):
     owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users_user.id", ondelete="SET NULL"))
     related_type: Mapped[str | None] = mapped_column(String(50))
     related_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # Phase 8 T3: correlation/request-id từ API (asgi-correlation-id) → propagate vào worker
+    # log để nối chuỗi trace API→background job.
+    request_id: Mapped[str | None] = mapped_column(String(255))
     result: Mapped[dict | None] = mapped_column(JSONB)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default="now()")

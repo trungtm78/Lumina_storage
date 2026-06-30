@@ -120,6 +120,11 @@ async def mark_ingest_status(session_factory, task_id: uuid.UUID, status: str, *
         bg = await s.get(BackgroundTask, task_id)
         if bg is None:
             return
+        # Phase 8 T3: set lại correlation/request-id vào ContextVar khi task bắt đầu (running)
+        # → log worker sau đó gắn request_id (nối chuỗi trace API→job).
+        if status == "running" and bg.request_id:
+            from asgi_correlation_id.context import correlation_id
+            correlation_id.set(bg.request_id)
         bg.status = status
         # Phase 3 T5: dọn field đối lập để ARQ retry không để lại trạng thái mâu thuẫn
         # (vd success kèm error_message cũ). fields truyền vào sẽ ghi đè bên dưới.

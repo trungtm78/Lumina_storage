@@ -5,7 +5,8 @@ from arq.cron import cron
 
 from src.core.config import get_settings
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s", force=True)
+from src.core.logging import configure_worker_logging
+configure_worker_logging()  # Phase 8 T3: log worker gắn request_id (correlation propagate)
 from src.worker.context import shutdown, startup
 from src.worker.tasks.agent_state_cleanup import cleanup_agent_state_task
 from src.worker.tasks.demo import long_running_task, ping_task

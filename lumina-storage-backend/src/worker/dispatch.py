@@ -51,12 +51,18 @@ async def dispatch_task(
         if existing is not None:
             return existing
 
+    # Phase 8 T3: bắt correlation/request-id của request hiện tại → lưu vào record để worker
+    # set lại vào ContextVar (nối chuỗi trace API→job). Rỗng nếu dispatch ngoài HTTP context.
+    from asgi_correlation_id.context import correlation_id
+    request_id = correlation_id.get()
+
     record = BackgroundTask(
         task_name=task_name,
         status="pending",
         owner_id=owner_id,
         related_type=related_type,
         related_id=related_id,
+        request_id=request_id,
     )
     db.add(record)
     try:
