@@ -34,6 +34,7 @@ def _chunk_page(chunk) -> int:
 
 class LandingAIProvider(ExtractionProvider):
     name = "landing_ai"
+    sdk_module = "agentic_doc"  # optional SDK
 
     def __init__(
         self, *, api_key: str | None, base_url: str | None = None, options: dict | None = None,

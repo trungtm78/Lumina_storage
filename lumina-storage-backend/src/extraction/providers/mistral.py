@@ -14,6 +14,7 @@ _DEFAULT_MODEL = "mistral-ocr-latest"
 
 class MistralProvider(ExtractionProvider):
     name = "mistral"
+    sdk_module = "mistralai"  # optional SDK
 
     def __init__(
         self, *, api_key: str | None, model: str = _DEFAULT_MODEL,

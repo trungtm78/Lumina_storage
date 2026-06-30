@@ -49,6 +49,19 @@ dependencies = [
     "asgi-correlation-id>=4.3.0",
 ]
 
+# Phase 5b — SDK provider trích xuất OPTIONAL (chỉ cài khi bật provider tương ứng; chưa cài →
+# provider ẩn khỏi UI, không crash). Cài: `uv sync --extra extraction-mistral` (hoặc -all).
+# Gemini KHÔNG cần SDK riêng (qua litellm đã có).
+[project.optional-dependencies]
+extraction-mistral = ["mistralai>=1.0.0"]
+extraction-azure = ["azure-ai-documentintelligence>=1.0.0"]
+extraction-landing = ["agentic-doc>=0.1.0"]
+extraction-all = [
+    "mistralai>=1.0.0",
+    "azure-ai-documentintelligence>=1.0.0",
+    "agentic-doc>=0.1.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",

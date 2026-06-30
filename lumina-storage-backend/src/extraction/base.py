@@ -11,6 +11,21 @@ from src.services.text_extraction_service import PageResult
 
 class ExtractionProvider(ABC):
     name: str = "base"
+    # Module SDK optional cần để chạy provider (None = luôn khả dụng, vd LocalHybrid/Gemini-litellm).
+    sdk_module: str | None = None
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """Provider dùng được? (SDK optional đã cài). find_spec không import → rẻ.
+        find_spec RAISE ModuleNotFoundError nếu parent package thiếu (vd 'azure') → bắt → False."""
+        if not cls.sdk_module:
+            return True
+        import importlib.util
+
+        try:
+            return importlib.util.find_spec(cls.sdk_module) is not None
+        except (ImportError, ValueError):
+            return False
 
     @abstractmethod
     async def extract(

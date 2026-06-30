@@ -16,6 +16,11 @@ def get_provider_class(name: str) -> type[ExtractionProvider] | None:
     return REGISTRY.get(name)
 
 
+def available_providers() -> list[str]:
+    """Provider KHẢ DỤNG (SDK optional đã cài) — UI dropdown chỉ hiện cái này."""
+    return sorted(name for name, cls in REGISTRY.items() if cls.is_available())
+
+
 register(LocalHybridProvider.name, LocalHybridProvider)
 
 # Provider ngoài — import module an toàn (SDK lazy bên trong extract/test_connection;

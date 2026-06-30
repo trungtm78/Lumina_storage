@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, require_admin
 from src.core.database import get_db
-from src.extraction.registry import REGISTRY
+from src.extraction.registry import available_providers
 from src.models.user import User
 from src.schemas.extraction_provider_config import (
     ExtractionProviderConfigCreateRequest,
@@ -27,8 +27,8 @@ def _svc(db: AsyncSession = Depends(get_db)) -> ExtractionProviderConfigService:
 
 @router.get("/available", response_model=list[str])
 async def list_available_providers(_: User = Depends(require_admin)) -> list[str]:
-    """Provider đã đăng ký (Task 8 sẽ lọc theo SDK installed). UI dropdown dùng."""
-    return sorted(REGISTRY.keys())
+    """Provider KHẢ DỤNG (SDK optional đã cài) — UI dropdown. Provider thiếu SDK bị ẩn."""
+    return available_providers()
 
 
 @router.get("/public", response_model=list[ExtractionProviderConfigResponse])

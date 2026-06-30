@@ -14,6 +14,7 @@ _DEFAULT_MODEL = "prebuilt-layout"
 
 class AzureDIProvider(ExtractionProvider):
     name = "azure_di"
+    sdk_module = "azure.ai.documentintelligence"  # optional SDK
 
     def __init__(
         self, *, api_key: str | None, model: str = _DEFAULT_MODEL,
