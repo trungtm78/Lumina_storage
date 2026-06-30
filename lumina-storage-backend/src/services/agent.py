@@ -297,40 +297,17 @@ async def list_directory(
 
     ext_filter = [e.strip().lstrip(".") for e in extensions.split(",") if e.strip()] if extensions else []
 
-    conditions = [
-        "owner_id = :uid",
-        "deleted_at IS NULL",
-        "(source_type IS NULL OR source_type NOT IN ('skill_temp', 'template'))",
-    ]
-    params: dict = {"uid": deps.user.id}
-
-    if ext_filter:
-        all_exts = ext_filter + [f".{e}" for e in ext_filter]
-        conditions.append("extension = ANY(:exts)")
-        params["exts"] = all_exts
-
-    if q:
-        conditions.append("(title ILIKE :q OR original_filename ILIKE :q)")
-        params["q"] = f"%{q}%"
-
-    where = " AND ".join(conditions)
-    result = await deps.db.execute(
-        sa_text(
-            f"SELECT id, title, original_filename, extension "
-            f"FROM documents_document "
-            f"WHERE {where} "
-            f"ORDER BY updated_at DESC LIMIT 20"
-        ),
-        params,
+    from src.repositories.document import DocumentRepository
+    docs = await DocumentRepository(deps.db).list_workspace_files(
+        deps.user.id, extensions=ext_filter or None, q=q or None
     )
 
-    rows = result.fetchall()
-    if not rows:
+    if not docs:
         return "Workspace trống." if not q else f"Không tìm thấy file matching '{q}'."
 
     lines = ["Workspace files:"]
-    for r in rows:
-        lines.append(f"- **{r[1]}** (id=`{r[0]}`, file={r[2]}, ext={r[3]})")
+    for d in docs:
+        lines.append(f"- **{d.title}** (id=`{d.id}`, file={d.original_filename}, ext={d.extension})")
     return "\n".join(lines)
 
 
@@ -351,23 +328,13 @@ async def search_files(
     deps = _get_deps(config)
 
     if path == "workspace":
-        result = await deps.db.execute(
-            sa_text(
-                "SELECT id, title, original_filename, extension "
-                "FROM documents_document "
-                "WHERE owner_id = :uid AND deleted_at IS NULL "
-                "AND (source_type IS NULL OR source_type NOT IN ('skill_temp')) "
-                "AND (title ILIKE :q OR original_filename ILIKE :q) "
-                "ORDER BY updated_at DESC LIMIT 10"
-            ),
-            {"uid": deps.user.id, "q": f"%{query}%"},
-        )
-        rows = result.fetchall()
-        if not rows:
+        from src.repositories.document import DocumentRepository
+        docs = await DocumentRepository(deps.db).search_workspace_files(deps.user.id, query)
+        if not docs:
             return f"Không tìm thấy file matching '{query}'."
         lines = [f"Search results for '{query}':"]
-        for r in rows:
-            lines.append(f"- **{r[1]}** (id=`{r[0]}`, file={r[2]})")
+        for d in docs:
+            lines.append(f"- **{d.title}** (id=`{d.id}`, file={d.original_filename})")
         return "\n".join(lines)
 
     base_dir = Path(deps.settings.skills_dir).parent.resolve()
@@ -485,12 +452,10 @@ async def run_script(
     if skill_name:
         try:
             from src.services.ai_model_config_service import build_litellm_model
-            cfg_result = await deps.db.execute(
-                sa_text("SELECT value FROM core_systemconfig WHERE key = 'skill_model_config'")
-            )
-            cfg_row = cfg_result.fetchone()
-            if cfg_row and cfg_row[0]:
-                skill_config = cfg_row[0]
+            from src.repositories.system import SystemConfigRepository
+            cfg_obj = await SystemConfigRepository(deps.db).get_by_key("skill_model_config")
+            if cfg_obj and cfg_obj.value:
+                skill_config = cfg_obj.value
                 model_config_id = skill_config.get(skill_name)
                 if model_config_id:
                     from src.models.core import AIModelConfig
@@ -594,30 +559,21 @@ async def search_templates(
         query: Từ khóa tìm kiếm (vd: "hợp đồng thuê nhà", "thuê mặt bằng").
     """
     deps = _get_deps(config)
-    result = await deps.db.execute(
-        sa_text(
-            "SELECT id, title, description, original_filename, source_metadata "
-            "FROM documents_document "
-            "WHERE owner_id = :uid AND source_type = 'template' AND deleted_at IS NULL "
-            "AND (title ILIKE :q OR description ILIKE :q OR original_filename ILIKE :q) "
-            "ORDER BY updated_at DESC LIMIT 5"
-        ),
-        {"uid": deps.user.id, "q": f"%{query}%"},
-    )
-    rows = result.fetchall()
+    from src.repositories.document import DocumentRepository
+    docs = await DocumentRepository(deps.db).search_owned_templates(deps.user.id, query)
 
-    if not rows:
+    if not docs:
         return f"Không tìm thấy template nào matching '{query}'."
 
     lines = [f"Templates matching '{query}':"]
-    for r in rows:
-        meta = r[4] or {}
+    for d in docs:
+        meta = d.source_metadata or {}
         fields = meta.get("template_fields", [])
         source_doc = meta.get("source_document_id", "")
-        desc = r[2] or ""
+        desc = d.description or ""
         lines.append(
-            f"- **{r[1]}** (template_id=`{r[0]}`, source_doc=`{source_doc}`, "
-            f"fields={len(fields)}, file={r[3]})"
+            f"- **{d.title}** (template_id=`{d.id}`, source_doc=`{source_doc}`, "
+            f"fields={len(fields)}, file={d.original_filename})"
         )
         if desc:
             lines.append(f"  Mô tả: {desc}")

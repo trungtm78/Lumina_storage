@@ -211,6 +211,74 @@ class DocumentRepository(BaseRepository[Document]):
         )
         return list(result.scalars().all())
 
+    # ── Agent workspace queries (Phase 7: thay sa_text, GIỮ NGUYÊN semantics) ──
+
+    async def search_workspace_files(
+        self, user_id: uuid.UUID, q: str, limit: int = 10
+    ) -> list[Document]:
+        """File workspace của user theo từ khóa (exclude CHỈ skill_temp). (agent.search_files)"""
+        like = f"%{q}%"
+        result = await self.session.execute(
+            select(Document)
+            .where(
+                Document.owner_id == user_id,
+                Document.deleted_at.is_(None),
+                or_(Document.source_type.is_(None), Document.source_type.notin_(["skill_temp"])),
+                or_(Document.title.ilike(like), Document.original_filename.ilike(like)),
+            )
+            .order_by(Document.updated_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def list_workspace_files(
+        self,
+        user_id: uuid.UUID,
+        *,
+        extensions: list[str] | None = None,
+        q: str | None = None,
+        limit: int = 20,
+    ) -> list[Document]:
+        """File workspace (exclude skill_temp + template; lọc extension/từ khóa). (agent.list_directory)"""
+        conds = [
+            Document.owner_id == user_id,
+            Document.deleted_at.is_(None),
+            or_(Document.source_type.is_(None), Document.source_type.notin_(["skill_temp", "template"])),
+        ]
+        if extensions:
+            # Dual-expansion: chấp nhận cả 'docx' lẫn '.docx' (khớp raw cũ).
+            all_exts = list(extensions) + [f".{e}" for e in extensions]
+            conds.append(Document.extension.in_(all_exts))
+        if q:
+            like = f"%{q}%"
+            conds.append(or_(Document.title.ilike(like), Document.original_filename.ilike(like)))
+        result = await self.session.execute(
+            select(Document).where(*conds).order_by(Document.updated_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def search_owned_templates(
+        self, user_id: uuid.UUID, q: str, limit: int = 5
+    ) -> list[Document]:
+        """Template (source_type='template') của user; ILIKE title/description/filename. (agent.search_templates)"""
+        like = f"%{q}%"
+        result = await self.session.execute(
+            select(Document)
+            .where(
+                Document.owner_id == user_id,
+                Document.source_type == "template",
+                Document.deleted_at.is_(None),
+                or_(
+                    Document.title.ilike(like),
+                    Document.description.ilike(like),
+                    Document.original_filename.ilike(like),
+                ),
+            )
+            .order_by(Document.updated_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def get_accessible_paginated(
         self,
         user_id: uuid.UUID,
