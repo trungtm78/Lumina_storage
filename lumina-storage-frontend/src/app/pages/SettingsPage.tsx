@@ -12,6 +12,7 @@ import {
   Palette,
   Cpu,
   HardDrive,
+  FileSearch,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
@@ -40,6 +41,7 @@ import {
   SelectValue,
 } from "@/app/components/ui/select";
 import { StorageSettingsSection } from "@/app/components/settings/StorageSettingsSection";
+import { ExtractionProviderSettingsSection } from "@/app/components/settings/ExtractionProviderSettingsSection";
 import type {
   AIModelConfigResponse,
   AIModelConfigCreateRequest,
@@ -775,6 +777,10 @@ export function SettingsPage() {
                 {t("settings.tabs.skillShort")}
               </span>
             </TabsTrigger>
+            <TabsTrigger value="extraction" className="flex items-center gap-2">
+              <FileSearch className="h-4 w-4" />
+              <span className="hidden sm:inline">Extraction</span>
+            </TabsTrigger>
             <TabsTrigger value="storage" className="flex items-center gap-2">
               <HardDrive className="h-4 w-4" />
               {t("settings.tabs.storage")}
@@ -823,6 +829,10 @@ export function SettingsPage() {
             <div className="rounded-2xl border border-gray-200 bg-white shadow-sm">
               <SkillModelSection models={models} />
             </div>
+          </TabsContent>
+
+          <TabsContent value="extraction">
+            <ExtractionProviderSettingsSection />
           </TabsContent>
 
           <TabsContent value="storage">

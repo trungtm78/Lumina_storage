@@ -110,6 +110,15 @@ export const API_ENDPOINTS = {
     setDefault: (id: string) => `/ai-model-configs/${id}/set-default`,
   },
 
+  extractionProviderConfigs: {
+    list: "/extraction-provider-configs",
+    public: "/extraction-provider-configs/public",
+    available: "/extraction-provider-configs/available",
+    test: "/extraction-provider-configs/test",
+    detail: (id: string) => `/extraction-provider-configs/${id}`,
+    setDefault: (id: string) => `/extraction-provider-configs/${id}/set-default`,
+  },
+
   googleDrive: {
     import: "/google-drive/import",
     imports: "/google-drive/imports",
