@@ -12,13 +12,13 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.core.config import get_settings
-from src.services import chat_title_service as cts
+from src.domain.chat import chat_title_service as cts
 
 pytestmark = pytest.mark.asyncio
 
 
 async def test_resolve_title_llm_builds_deterministic(db_session):
-    with patch("src.services.chat_title_service.SkillService") as SkillCls:
+    with patch("src.domain.chat.chat_title_service.SkillService") as SkillCls:
         SkillCls.return_value.resolve_model = AsyncMock(
             return_value=("openai/gpt-4o", "key", "base", "v1", {})
         )

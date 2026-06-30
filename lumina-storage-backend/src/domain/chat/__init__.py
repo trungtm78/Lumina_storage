@@ -1,0 +1,1 @@
+"""Domain: chat (Phase 8 W3) — chat/agent/skill/citation/retrieval/excel_rag services + route chat. chat_permission/vector/embedding ĐÃ shared. Lưu ý: agent/skill/retrieval/excel_rag dùng cross-domain qua shim (finalize: cân nhắc shared)."""

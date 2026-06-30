@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage
 
 from src.core.config import Settings
 from src.models.chat import ChatSession
-from src.services.skill_service import SkillService
+from src.domain.chat.skill_service import SkillService
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@
 """
 import uuid
 
-import src.services.agent as agent_mod
+import src.domain.chat.agent as agent_mod
 from src.services.citation_service import citation_to_source, citations_to_sources
 
 
