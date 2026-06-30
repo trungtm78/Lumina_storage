@@ -22,8 +22,10 @@ register(LocalHybridProvider.name, LocalHybridProvider)
 # import provider module KHÔNG kéo SDK). Gemini qua litellm (luôn khả dụng).
 from src.extraction.providers.azure_di import AzureDIProvider  # noqa: E402
 from src.extraction.providers.gemini import GeminiProvider  # noqa: E402
+from src.extraction.providers.landing_ai import LandingAIProvider  # noqa: E402
 from src.extraction.providers.mistral import MistralProvider  # noqa: E402
 
 register(GeminiProvider.name, GeminiProvider)
 register(MistralProvider.name, MistralProvider)
 register(AzureDIProvider.name, AzureDIProvider)
+register(LandingAIProvider.name, LandingAIProvider)
